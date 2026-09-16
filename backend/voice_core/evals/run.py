@@ -148,11 +148,13 @@ async def _main_async(args: argparse.Namespace) -> int:
 
     cases = _load_jsonl(pack.pack_dir / "evals" / _SUITE_FILENAMES[args.suite])
 
+    pack_tool_names = frozenset(spec.name for spec in registry.tool_specs())
+
     outcomes: list[CaseOutcome] = []
     for _ in range(args.repeat):
         for case in cases:
             turns = await run_case(case, pack, registry, llm)
-            outcomes.append(evaluate_case(case, turns))
+            outcomes.append(evaluate_case(case, turns, pack_tool_names))
 
     accuracy = tool_selection_accuracy(outcomes)
     report = _render_report(args.pack, args.suite, llm_spec, mode, outcomes, accuracy)

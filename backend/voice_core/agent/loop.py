@@ -154,7 +154,9 @@ async def run_text_turn(
                 reply_text=reply,
                 reply_language=language,
                 tools_called=[pending_write.tool],
-                tool_results=[{"tool": pending_write.tool, "data": result.data}],
+                tool_results=[
+                    {"tool": pending_write.tool, "data": result.data, "args": pending_write.args}
+                ],
                 pending_action=None,
                 pending_write_args=None,
                 executed=(result.status == "ok"),
@@ -223,7 +225,7 @@ async def run_text_turn(
             if pack_tool.resolve_for_confirm:
                 tools_called.append(pack_tool.resolve_for_confirm)
             tools_called.append(write_call.name)
-            tool_results.append({"tool": write_call.name, "data": resolved_fields})
+            tool_results.append({"tool": write_call.name, "data": resolved_fields, "args": args})
 
             confirm_template = (pack_tool.confirm or {}).get(current_language, "")
             summary = render_confirm_template(confirm_template, resolved_fields)
@@ -245,7 +247,7 @@ async def run_text_turn(
             args = json.loads(call.args_json)
             tools_called.append(call.name)
             result = await registry.dispatch(call.name, args, ctx, handler)
-            tool_results.append({"tool": call.name, "data": result.data})
+            tool_results.append({"tool": call.name, "data": result.data, "args": args})
 
             if call.name == "set_preferred_language" and result.status == "ok":
                 current_language = args["language"]
