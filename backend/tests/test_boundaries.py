@@ -1,0 +1,52 @@
+"""Enforces CLAUDE.md golden rule 1: the core never knows the domain."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+CORE_DIRS = [
+    REPO_ROOT / "backend" / "voice_core",
+    REPO_ROOT / "flutter_voice" / "lib",
+]
+
+DOMAIN_WORDS = [
+    "crop",
+    "farmer",
+    "bid",
+    "listing",
+    "buyer",
+    "pickup",
+    "prebid",
+    "pre-bid",
+    "rescue",
+    "quintal",
+    "quintals",
+    "kg",
+    "mandi",
+    "harvest",
+]
+
+WORD_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in DOMAIN_WORDS) + r")\b", re.IGNORECASE
+)
+
+
+def _source_files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return [p for p in root.rglob("*") if p.suffix in {".py", ".dart"} and p.is_file()]
+
+
+def test_core_never_mentions_the_domain() -> None:
+    violations: list[str] = []
+    for core_dir in CORE_DIRS:
+        for path in _source_files(core_dir):
+            text = path.read_text(encoding="utf-8")
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if WORD_PATTERN.search(line):
+                    violations.append(f"{path.relative_to(REPO_ROOT)}:{lineno}: {line.strip()}")
+
+    assert not violations, "Domain words leaked into core:\n" + "\n".join(violations)
