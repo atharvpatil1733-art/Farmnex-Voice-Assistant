@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -12,6 +13,7 @@ class Settings(BaseSettings):
     app_env: str = "dev"
     log_level: str = "INFO"
     domain_pack: str = "farm_marketplace"
+    domain_packs_dir: Path = Path("../domain_packs")
     tool_mode: Literal["mock", "live"] = "mock"
 
     # Supabase / Postgres
