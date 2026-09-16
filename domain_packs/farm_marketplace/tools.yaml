@@ -8,7 +8,7 @@
     Use when the user refers to "my crop / मेरी फसल / माझा माल" without an id, or asks what they have listed.
   params: {type: object, additionalProperties: false, properties: {status: {type: string, enum: [any, active, sold]}}}
   handler: {type: mock, fixture: fixtures/listings.json}
-  result_fields: [listing_ref, crop, quantity_kg, status, bidding_ends_at, harvest_date]
+  result_fields: [listings]
   result_hint: "If more than one active listing, ask which crop they mean."
   display_hint: {hi-IN: "आपकी लिस्टिंग देख रही हूँ", mr-IN: "तुमच्या लिस्टिंग बघते", en-IN: "Checking your listings"}
 
