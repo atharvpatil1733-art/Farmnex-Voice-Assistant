@@ -1,0 +1,1 @@
+{"status": "ok", "data": {"crop": "{{args.crop}}", "district": "Pune", "trend": "rising", "confidence": "medium", "horizon_weeks": 3}}

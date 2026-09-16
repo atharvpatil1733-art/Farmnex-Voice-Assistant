@@ -1,0 +1,6 @@
+{"crops": [
+  {"id": "onion", "names": {"hi-IN": "प्याज़", "mr-IN": "कांदा", "en-IN": "onion"}},
+  {"id": "tomato", "names": {"hi-IN": "टमाटर", "mr-IN": "टोमॅटो", "en-IN": "tomato"}},
+  {"id": "soybean", "names": {"hi-IN": "सोयाबीन", "mr-IN": "सोयाबीन", "en-IN": "soybean"}},
+  {"id": "pomegranate", "names": {"hi-IN": "अनार", "mr-IN": "डाळिंब", "en-IN": "pomegranate"}}
+]}

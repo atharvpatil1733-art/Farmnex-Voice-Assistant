@@ -1,0 +1,26 @@
+id: create_prebid_listing
+tool: create_prebid_listing
+start_phrases:
+  hi-IN: ["फसल बेचनी है", "माल बेचना है", "बिक्री करनी है"]
+  mr-IN: ["पीक विकायचे आहे", "माल विकायचा आहे"]
+  en-IN: ["sell my crop", "sell produce", "create listing"]
+slots:
+  - name: crop
+    ask: {hi-IN: "कौन सी फसल बेचनी है?", mr-IN: "कोणते पीक विकायचे आहे?", en-IN: "Which crop do you want to sell?"}
+    validate: {enum_from: fixtures/crops.json, fuzzy: true}
+  - name: quantity_kg
+    ask: {hi-IN: "कितना माल है? किलो या क्विंटल में बताइए।", mr-IN: "किती माल आहे? किलो किंवा क्विंटलमध्ये सांगा.", en-IN: "How much? Tell me in kilos or quintals."}
+    validate: {type: number, min: 1, max: 100000}
+    unit_parsing: {quintal: 100, क्विंटल: 100, ton: 1000, टन: 1000, kilo: 1, किलो: 1}
+  - name: harvest_date
+    ask: {hi-IN: "कटाई कब होगी?", mr-IN: "काढणी कधी होणार?", en-IN: "When will you harvest?"}
+    validate: {type: date, not_before: today, max_days_ahead: 30}
+  - name: photo
+    required: false
+    ask: {hi-IN: "चाहें तो फसल की फोटो डालिए, इससे अच्छी बोली मिलती है।", mr-IN: "हवे असल्यास पिकाचा फोटो टाका.", en-IN: "You can add a photo of the crop for better bids."}
+    client_action: {name: open_photo_picker}
+    wait_for: client_action.result
+exit_phrases:
+  hi-IN: ["रहने दो", "बाद में"]
+  mr-IN: ["राहू द्या", "नंतर"]
+  en-IN: ["never mind", "later"]

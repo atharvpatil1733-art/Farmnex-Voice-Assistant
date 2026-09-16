@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv sync:*)",
+      "Bash(uv run pytest:*)",
+      "Bash(uv run ruff:*)",
+      "Bash(uv run bandit:*)",
+      "Bash(uv run python -m voice_core.evals.run:*)",
+      "Bash(uv run python -m voice_core.kb.ingest --dry-run:*)",
+      "Bash(flutter analyze:*)",
+      "Bash(flutter test:*)",
+      "Bash(dart format:*)",
+      "Bash(git diff:*)",
+      "Bash(git status:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./backend/.env)",
+      "Bash(supabase db reset:*)",
+      "Bash(git push --force:*)"
+    ]
+  }
+}

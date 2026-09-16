@@ -1,0 +1,8 @@
+{"id":"r-001","question":"प्री बिडिंग कितने दिन चलती है?","language":"hi-IN","expected_slugs":["pre-bidding-basics"]}
+{"id":"r-002","question":"प्री-बिडिंगसाठी काय लागते?","language":"mr-IN","expected_slugs":["pre-bidding-basics"]}
+{"id":"r-003","question":"Do I have to accept the highest bid?","language":"en-IN","expected_slugs":["pre-bidding-basics"]}
+{"id":"r-004","question":"माल खराब होने वाला है तो क्या करूँ?","language":"hi-IN","expected_slugs":["crop-rescue-basics"]}
+{"id":"r-005","question":"क्रॉप रेस्क्यूमध्ये भाव कमी मिळतो का?","language":"mr-IN","expected_slugs":["crop-rescue-basics"]}
+{"id":"r-006","question":"What is a return trip pickup?","language":"en-IN","expected_slugs":["pickup-logistics-basics"]}
+{"id":"r-007","question":"ट्रक कब आएगा यह कैसे पता चलेगा?","language":"hi-IN","expected_slugs":["pickup-logistics-basics"]}
+{"id":"r-008","question":"माल कोण उचलून नेतो?","language":"mr-IN","expected_slugs":["pickup-logistics-basics"]}

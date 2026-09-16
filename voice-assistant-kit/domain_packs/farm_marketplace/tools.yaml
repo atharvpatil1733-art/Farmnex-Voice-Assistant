@@ -1,0 +1,132 @@
+# Tool contracts. Handlers are mock until host endpoints exist (see docs/PORTING.md).
+# Identity is NEVER a parameter: handlers receive ctx.user_ref from the verified JWT.
+
+- name: get_my_listings
+  kind: read
+  description: >-
+    The user's own produce listings with status (pre_bidding, open, sold, rescue, cancelled).
+    Use when the user refers to "my crop / मेरी फसल / माझा माल" without an id, or asks what they have listed.
+  params: {type: object, additionalProperties: false, properties: {status: {type: string, enum: [any, active, sold]}}}
+  handler: {type: mock, fixture: fixtures/listings.json}
+  result_fields: [listing_ref, crop, quantity_kg, status, bidding_ends_at, harvest_date]
+  result_hint: "If more than one active listing, ask which crop they mean."
+  display_hint: {hi-IN: "आपकी लिस्टिंग देख रही हूँ", mr-IN: "तुमच्या लिस्टिंग बघते", en-IN: "Checking your listings"}
+
+- name: get_bids_for_listing
+  kind: read
+  description: >-
+    Current bids on one of the user's listings, highest first. Use when the user asks about bids,
+    offers, बोली, or the best price received. Not for general market prices (use get_demand_forecast).
+  params:
+    type: object
+    additionalProperties: false
+    required: [listing_ref]
+    properties:
+      listing_ref: {type: string, description: "Listing id, or 'latest' for the most recent active listing"}
+  handler: {type: mock, fixture: fixtures/bids.json}
+  result_fields: [listing_ref, crop, quantity_kg, bidding_ends_at, bids]
+  result_hint: "Speak the highest bid first and at most two bids. Mention when bidding ends."
+  display_hint: {hi-IN: "बोलियाँ देख रही हूँ", mr-IN: "बोली तपासते", en-IN: "Checking bids"}
+
+- name: get_order_status
+  kind: read
+  description: Status of the user's sold orders including payment state. Use for "पैसे कब आएँगे", payment, or order questions.
+  params: {type: object, additionalProperties: false, properties: {order_ref: {type: string, description: "Order id or 'latest'"}}}
+  handler: {type: mock, fixture: fixtures/orders.json}
+  result_fields: [order_ref, crop, quantity_kg, price_per_kg, status, payment_status, payment_expected_on]
+  display_hint: {hi-IN: "ऑर्डर देख रही हूँ", mr-IN: "ऑर्डर बघते", en-IN: "Checking your order"}
+
+- name: get_pickup_status
+  kind: read
+  description: Pickup/transport status for an order — vehicle assigned, pickup date and time window, driver first name. Use for "माल कब उठेगा", "गाडी कधी येणार", pickup questions.
+  params: {type: object, additionalProperties: false, properties: {order_ref: {type: string, description: "Order id or 'latest'"}}}
+  handler: {type: mock, fixture: fixtures/pickups.json}
+  result_fields: [order_ref, status, pickup_date, window_start, window_end, driver_first_name, is_return_trip]
+  display_hint: {hi-IN: "पिकअप की जानकारी देख रही हूँ", mr-IN: "पिकअपची माहिती बघते", en-IN: "Checking pickup"}
+
+- name: get_demand_forecast
+  kind: read
+  description: >-
+    Estimated demand trend (rising, stable, falling) for a crop in the user's district over the next weeks.
+    Use when the user asks whether to sell now or wait, or about demand. It is an estimate, not a price promise.
+  params:
+    type: object
+    additionalProperties: false
+    required: [crop]
+    properties:
+      crop: {type: string}
+  handler: {type: mock, fixture: fixtures/forecast.json}
+  result_fields: [crop, district, trend, confidence, horizon_weeks]
+  result_hint: "Say it is an estimate. Don't give exact future prices."
+  display_hint: {hi-IN: "मांग का अनुमान देख रही हूँ", mr-IN: "मागणीचा अंदाज बघते", en-IN: "Checking demand estimate"}
+
+- name: create_prebid_listing
+  kind: write
+  description: >-
+    Create a pre-bidding listing for produce that will be harvested soon; buyers can bid for 7 days.
+    Use only at the end of the create_prebid_listing workflow when crop, quantity, and harvest date are known.
+  params:
+    type: object
+    additionalProperties: false
+    required: [crop, quantity_kg, harvest_date]
+    properties:
+      crop: {type: string}
+      quantity_kg: {type: number, minimum: 1, maximum: 100000}
+      harvest_date: {type: string, format: date}
+      min_price_per_kg: {type: number, minimum: 0}
+  confirm:
+    hi-IN: "{quantity_kg} किलो {crop}, कटाई {harvest_date}, सात दिन की प्री-बिडिंग शुरू करूँ?"
+    mr-IN: "{quantity_kg} किलो {crop}, काढणी {harvest_date}, सात दिवसांची प्री-बिडिंग सुरू करू का?"
+    en-IN: "Start 7-day pre-bidding for {quantity_kg} kilos of {crop}, harvest on {harvest_date}?"
+  success_message:
+    hi-IN: "आपकी प्री-बिडिंग शुरू हो गई है। बोली आने पर मैं बता दूँगी।"
+    mr-IN: "तुमची प्री-बिडिंग सुरू झाली आहे."
+    en-IN: "Your pre-bidding has started."
+  handler: {type: mock, fixture: fixtures/create_listing_ok.json}
+  client_actions_on_success: [{name: refresh, params: {resource: listings}}]
+
+- name: accept_bid
+  kind: write
+  description: >-
+    Accept one specific bid on the user's listing. Use only after the user clearly chooses a bid
+    (for example "the highest one"). Never use just to check bids.
+  params:
+    type: object
+    additionalProperties: false
+    required: [listing_ref, bid_ref]
+    properties:
+      listing_ref: {type: string}
+      bid_ref: {type: string, description: "Bid id returned by get_bids_for_listing"}
+  resolve_for_confirm: get_bids_for_listing
+  confirm:
+    hi-IN: "{quantity_kg} किलो {crop} के लिए {price_per_kg} रुपये किलो की बोली स्वीकार करूँ?"
+    mr-IN: "{quantity_kg} किलो {crop} साठी {price_per_kg} रुपये किलोची बोली स्वीकारू का?"
+    en-IN: "Accept the bid of {price_per_kg} rupees per kilo for {quantity_kg} kilos of {crop}?"
+  success_message:
+    hi-IN: "बोली स्वीकार हो गई है। पिकअप की जानकारी जल्द मिलेगी।"
+    mr-IN: "बोली स्वीकारली आहे. पिकअपची माहिती लवकरच मिळेल."
+    en-IN: "The bid is accepted. Pickup details will follow soon."
+  handler: {type: mock, fixture: fixtures/accept_bid_ok.json}
+
+- name: request_crop_rescue
+  kind: write
+  description: >-
+    Put an at-risk listing into Crop Rescue so nearby buyers get a fast, discounted offer before
+    the produce spoils. Use when the user says produce is spoiling, won't last, or buyers backed out.
+  params:
+    type: object
+    additionalProperties: false
+    required: [listing_ref, days_left]
+    properties:
+      listing_ref: {type: string}
+      days_left: {type: integer, minimum: 0, maximum: 14, description: "Days before produce spoils, as the user estimates"}
+  confirm:
+    hi-IN: "आपके {crop} को क्रॉप रेस्क्यू में डालूँ? पास के खरीदारों को तुरंत सूचना जाएगी।"
+    mr-IN: "तुमचा {crop} क्रॉप रेस्क्यूमध्ये टाकू का? जवळच्या खरेदीदारांना लगेच कळवले जाईल."
+    en-IN: "Put your {crop} into Crop Rescue? Nearby buyers will be alerted right away."
+  resolve_for_confirm: get_my_listings
+  success_message:
+    hi-IN: "क्रॉप रेस्क्यू शुरू हो गया है।"
+    mr-IN: "क्रॉप रेस्क्यू सुरू झाले आहे."
+    en-IN: "Crop Rescue has started."
+  handler: {type: mock, fixture: fixtures/rescue_ok.json}

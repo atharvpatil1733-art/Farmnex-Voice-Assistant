@@ -1,0 +1,43 @@
+# Domain pack: farm marketplace (SIH 2026 prototype)
+id: farm_marketplace
+app_name: "BhumiBij"          # rename freely; used in persona and knowledge
+pack_version: 0.1.0
+languages: [hi-IN, mr-IN, en-IN]
+default_language: hi-IN
+timezone: Asia/Kolkata
+
+voice:
+  tts_speaker: "<audition female bulbul:v3 voices and set one>"
+  speech_pace: 0.95           # slightly slower for clarity
+
+persona_file: persona.md
+tools_file: tools.yaml
+workflows_dir: workflows
+knowledge_dir: knowledge
+fixtures_dir: fixtures
+
+fillers:                       # spoken once if a tool takes > 1.2 s
+  hi-IN: "एक सेकंड, देख रही हूँ।"
+  mr-IN: "एक सेकंद, बघते."
+  en-IN: "One moment, let me check."
+
+stt_context:                   # vocabulary hints if the STT provider supports them
+  - प्री-बिडिंग
+  - क्रॉप रेस्क्यू
+  - पिकअप
+  - बोली
+  - क्विंटल
+
+confirmation_lexicon_extra:
+  yes: ["हो करा", "चालेल", "हाँ जी", "कर दो"]
+  no: ["नको", "राहू द्या", "रहने दो"]
+
+client_actions:                # allowlist; host app must implement each
+  - navigate
+  - open_photo_picker
+  - refresh
+
+evals:
+  golden: evals/golden.jsonl
+  retrieval: evals/retrieval.jsonl
+  redteam: evals/redteam.jsonl

@@ -1,0 +1,4 @@
+{"status": "ok", "data": {"listings": [
+  {"listing_ref": "L-102", "crop": "onion", "quantity_kg": 500, "status": "pre_bidding", "harvest_date": "2026-09-22", "bidding_ends_at": "2026-09-19T18:00:00+05:30"},
+  {"listing_ref": "L-087", "crop": "tomato", "quantity_kg": 300, "status": "open", "harvest_date": "2026-09-14", "bidding_ends_at": "2026-09-17T18:00:00+05:30"}
+]}}

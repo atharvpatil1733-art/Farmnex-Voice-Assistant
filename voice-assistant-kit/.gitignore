@@ -1,0 +1,11 @@
+.env
+*.env
+!.env.example
+__pycache__/
+.venv/
+.pytest_cache/
+.ruff_cache/
+evals/reports/
+flutter_*/build/
+flutter_*/.dart_tool/
+supabase/.temp/
