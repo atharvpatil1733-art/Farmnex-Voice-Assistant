@@ -3,7 +3,13 @@
 Update after every milestone. Keep it short and factual.
 
 ## Current milestone
-M1 — text brain implemented, gate blocked (see Known issues)
+M2 — knowledge (RAG) starting. M1 code is complete and committed to local `main`
+(not yet pushed to `origin/main`); its numeric gate (≥85% tool-selection accuracy) is
+**still unverified**, not failed — see Known issues. Per explicit user direction, M2 is
+starting anyway rather than waiting on infra (rate limits + host memory) to cooperate;
+this is a deliberate deviation from CLAUDE.md's "don't start the next milestone until
+the current gate is true" rule, not an accidental skip. Revisit the M1 gate once a
+clean eval run is possible.
 
 ## What works
 - Repo layout under `backend/` per CLAUDE.md: `app/`, `voice_core/{ports,adapters,agent,tools,kb,
@@ -71,6 +77,15 @@ M1 — text brain implemented, gate blocked (see Known issues)
 - `.env` currently sets `llm_model=gemini-3.8-flash` but the last gate run was invoked with
   `--llm gemini:gemini-2.5-flash` explicitly; confirm which model the gate should target before
   the next run.
+- 2026-09-18: repeated attempts to re-run the gate all failed for infra reasons, not code —
+  `gemini-3.8-flash` returned persistent `503 UNAVAILABLE` (model overloaded), `gemini-2.5-flash`
+  hit its free-tier `429` per-minute cap immediately (fixed with retry/backoff in
+  `voice_core/adapters/gemini/llm.py`), and every subsequent attempt (including a 5-case chunk)
+  was killed by the *host* running at ~5% free memory (~435MB free of ~8GB). Added
+  `--offset`/`--limit` to `evals/run.py` plus per-case incremental report writes so a killed run
+  keeps whatever partial results it got instead of losing everything — confirmed working (a
+  2-case partial report survived one of the kills). Held off entirely until host memory frees up;
+  no further gate attempts should be made below roughly 20-30% free memory.
 - One real bug found and fixed this session (see decisions log): `get_my_listings` was returning
   empty data to the LLM. Re-run the gate to see how much of the 31.6% it accounts for — likely
   a meaningful chunk, but the quota exhaustion means the current report can't isolate its effect.
