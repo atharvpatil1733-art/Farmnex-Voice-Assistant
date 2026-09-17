@@ -146,25 +146,30 @@ async def _main_async(args: argparse.Namespace) -> int:
     llm_spec = args.llm or f"{settings.llm_provider}:{settings.llm_model}"
     llm, mode = _resolve_llm(llm_spec, settings)
 
-    cases = _load_jsonl(pack.pack_dir / "evals" / _SUITE_FILENAMES[args.suite])
+    all_cases = _load_jsonl(pack.pack_dir / "evals" / _SUITE_FILENAMES[args.suite])
+    cases = all_cases[args.offset : args.offset + args.limit if args.limit else None]
 
     pack_tool_names = frozenset(spec.name for spec in registry.tool_specs())
+
+    reports_dir = backend_dir / "evals" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    report_path = reports_dir / f"{timestamp}-{args.suite}.md"
 
     outcomes: list[CaseOutcome] = []
     for _ in range(args.repeat):
         for case in cases:
             turns = await run_case(case, pack, registry, llm)
             outcomes.append(evaluate_case(case, turns, pack_tool_names))
+            # Write after every case so a killed/interrupted run still leaves usable partial
+            # results instead of nothing (this suite can take 10-20+ minutes on a throttled
+            # free-tier API key).
+            accuracy = tool_selection_accuracy(outcomes)
+            report = _render_report(args.pack, args.suite, llm_spec, mode, outcomes, accuracy)
+            report_path.write_text(report, encoding="utf-8")
+            print(f"[{len(outcomes)}/{len(cases) * args.repeat}] {case['id']} done", flush=True)
 
     accuracy = tool_selection_accuracy(outcomes)
-    report = _render_report(args.pack, args.suite, llm_spec, mode, outcomes, accuracy)
-
-    reports_dir = backend_dir / "evals" / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    report_path = reports_dir / f"{timestamp}-{args.suite}.md"
-    report_path.write_text(report, encoding="utf-8")
-
     print(f"mode={mode} suite={args.suite} cases={len(cases)} repeat={args.repeat}")
     print(f"tool_selection_accuracy={accuracy:.1f}%")
     print(f"report: {report_path}")
@@ -177,6 +182,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--suite", choices=["text", "redteam", "retrieval"], default="text")
     parser.add_argument("--llm", default=None, help="fake | gemini:<model>")
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--offset", type=int, default=0, help="skip the first N cases")
+    parser.add_argument("--limit", type=int, default=0, help="run at most N cases (0 = all)")
     return parser.parse_args(argv)
 
 

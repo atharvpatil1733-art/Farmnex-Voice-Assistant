@@ -26,9 +26,7 @@ def _turn(
 def test_no_tool_arg_keys_fails_when_a_forbidden_key_was_passed_to_a_tool() -> None:
     turns = [
         _turn(
-            tool_results=[
-                {"tool": "get_bids_for_listing", "data": {}, "args": {"user_id": "u-1"}}
-            ]
+            tool_results=[{"tool": "get_bids_for_listing", "data": {}, "args": {"user_id": "u-1"}}]
         )
     ]
     case = {"id": "t1", "expect": {"no_tool_arg_keys": ["user_id", "farmer_id"]}}
