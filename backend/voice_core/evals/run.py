@@ -8,11 +8,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from voice_core.adapters.fakes.embeddings import FakeEmbedding
 from voice_core.adapters.fakes.llm import FakeLLM
 from voice_core.agent.loop import PendingWrite, TurnResult, run_text_turn
 from voice_core.config import Settings, get_settings
 from voice_core.evals.metrics import CaseOutcome, evaluate_case, tool_selection_accuracy
+from voice_core.kb.retriever import search_knowledge
 from voice_core.packs.loader import LoadedPack, load_pack
+from voice_core.ports.embeddings import EmbeddingProvider
+from voice_core.ports.knowledge import KnowledgeStore
 from voice_core.ports.llm import LLMProvider
 from voice_core.ports.types import ChatMessage, ToolContext
 from voice_core.tools.handlers.mock import MockToolHandler
@@ -36,6 +40,25 @@ def _resolve_llm(spec: str, settings: Settings) -> tuple[LLMProvider, str]:
     raise ValueError(f"unknown --llm spec: {spec!r} (use fake or gemini:<model>)")
 
 
+def _build_embeddings(settings: Settings) -> EmbeddingProvider:
+    if settings.embedding_provider == "gemini":
+        from voice_core.adapters.gemini.embeddings import GeminiEmbedding
+
+        return GeminiEmbedding(api_key=settings.llm_api_key, dim=settings.embedding_dim)
+    return FakeEmbedding(dim=settings.embedding_dim)
+
+
+def _build_knowledge_store(settings: Settings) -> KnowledgeStore | None:
+    if not settings.database_url:
+        return None
+    from voice_core.adapters.supabase.store import SupabaseKnowledgeStore
+
+    return SupabaseKnowledgeStore(
+        database_url=settings.database_url,
+        statement_cache_size=settings.db_statement_cache_size,
+    )
+
+
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     cases = []
     with path.open(encoding="utf-8") as f:
@@ -51,6 +74,9 @@ async def run_case(
     pack: LoadedPack,
     registry: ToolRegistry,
     llm: LLMProvider,
+    embeddings: EmbeddingProvider | None = None,
+    knowledge_store: KnowledgeStore | None = None,
+    auto_rag_min_sim: float = 0.45,
 ) -> list[TurnResult]:
     handler = MockToolHandler(pack.pack_dir, fixture_overrides=case.get("fixture_overrides"))
     ctx = ToolContext(user_ref="eval-user", language=case["language"])
@@ -71,6 +97,9 @@ async def run_case(
             history=history,
             user_text=user_text,
             pending_write=pending_write,
+            embeddings=embeddings,
+            knowledge_store=knowledge_store,
+            auto_rag_min_sim=auto_rag_min_sim,
         )
         results.append(result)
 
@@ -116,7 +145,7 @@ def _render_report(
     ]
     excluded = [o.case_id for o in outcomes if o.excluded]
     if excluded:
-        lines.append(f"Excluded from the accuracy denominator (no KB until M2): {excluded}")
+        lines.append(f"Excluded from the accuracy denominator: {excluded}")
         lines.append("")
 
     lines.append("| case | structural | content | failing checks |")
@@ -132,16 +161,112 @@ def _render_report(
     return "\n".join(lines) + "\n"
 
 
-async def _main_async(args: argparse.Namespace) -> int:
-    if args.suite == "retrieval":
-        print("retrieval suite needs a KnowledgeStore (M2); not runnable yet.", file=sys.stderr)
-        return 1
+async def run_retrieval_suite(
+    cases: list[dict[str, Any]],
+    pack_id: str,
+    embeddings: EmbeddingProvider,
+    store: KnowledgeStore,
+    k: int = 3,
+) -> tuple[float, float, float, list[dict[str, Any]]]:
+    hits_at_1 = 0
+    hits_at_3 = 0
+    mrr_total = 0.0
+    rows: list[dict[str, Any]] = []
 
+    for case in cases:
+        chunks = await search_knowledge(
+            query=case["question"],
+            pack_id=pack_id,
+            language=case["language"],
+            embeddings=embeddings,
+            store=store,
+            k=k,
+            min_similarity=0.0,
+        )
+        retrieved = [c.doc_slug for c in chunks]
+        expected = set(case["expected_slugs"])
+
+        hit1 = bool(retrieved[:1]) and retrieved[0] in expected
+        hit3 = any(slug in expected for slug in retrieved[:3])
+        rank = next((i + 1 for i, slug in enumerate(retrieved) if slug in expected), None)
+
+        hits_at_1 += int(hit1)
+        hits_at_3 += int(hit3)
+        mrr_total += 1.0 / rank if rank else 0.0
+        rows.append(
+            {
+                "id": case["id"],
+                "expected": sorted(expected),
+                "retrieved": retrieved,
+                "hit@3": hit3,
+            }
+        )
+
+    n = len(cases) or 1
+    return (100.0 * hits_at_1 / n, 100.0 * hits_at_3 / n, mrr_total / n, rows)
+
+
+def _render_retrieval_report(
+    pack_id: str, hit1: float, hit3: float, mrr: float, rows: list[dict[str, Any]]
+) -> str:
+    lines = [
+        f"# Retrieval eval report: {pack_id}",
+        "",
+        f"- hit@1: {hit1:.1f}%",
+        f"- hit@3: {hit3:.1f}%",
+        f"- MRR: {mrr:.3f}",
+        f"- cases: {len(rows)}",
+        "",
+        "| case | expected | retrieved | hit@3 |",
+        "|---|---|---|---|",
+    ]
+    for row in rows:
+        status = "PASS" if row["hit@3"] else "FAIL"
+        lines.append(f"| {row['id']} | {row['expected']} | {row['retrieved']} | {status} |")
+    return "\n".join(lines) + "\n"
+
+
+async def _run_retrieval(args: argparse.Namespace, pack: LoadedPack, settings: Settings) -> int:
+    knowledge_store = _build_knowledge_store(settings)
+    if knowledge_store is None:
+        print("retrieval suite needs DATABASE_URL set (backend/.env)", file=sys.stderr)
+        return 1
+    embeddings = _build_embeddings(settings)
+
+    cases = _load_jsonl(pack.pack_dir / "evals" / _SUITE_FILENAMES["retrieval"])
+    cases = cases[args.offset : args.offset + args.limit if args.limit else None]
+
+    hit1, hit3, mrr, rows = await run_retrieval_suite(cases, args.pack, embeddings, knowledge_store)
+
+    backend_dir = Path(__file__).resolve().parents[2]
+    reports_dir = backend_dir / "evals" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    report_path = reports_dir / f"{timestamp}-retrieval.md"
+    report_path.write_text(
+        _render_retrieval_report(args.pack, hit1, hit3, mrr, rows), encoding="utf-8"
+    )
+
+    if hasattr(knowledge_store, "close"):
+        await knowledge_store.close()
+
+    print(f"hit@1={hit1:.1f}% hit@3={hit3:.1f}% mrr={mrr:.3f} cases={len(cases)}")
+    print(f"report: {report_path}")
+    return 0 if hit3 >= 90.0 else 1
+
+
+async def _main_async(args: argparse.Namespace) -> int:
     settings = get_settings()
     backend_dir = Path(__file__).resolve().parents[2]
     packs_root = (backend_dir / settings.domain_packs_dir).resolve()
     pack = load_pack(args.pack, packs_root)
-    registry = ToolRegistry(pack)
+
+    if args.suite == "retrieval":
+        return await _run_retrieval(args, pack, settings)
+
+    embeddings = _build_embeddings(settings)
+    knowledge_store = _build_knowledge_store(settings)
+    registry = ToolRegistry(pack, embeddings=embeddings, knowledge_store=knowledge_store)
 
     llm_spec = args.llm or f"{settings.llm_provider}:{settings.llm_model}"
     llm, mode = _resolve_llm(llm_spec, settings)
@@ -159,7 +284,15 @@ async def _main_async(args: argparse.Namespace) -> int:
     outcomes: list[CaseOutcome] = []
     for _ in range(args.repeat):
         for case in cases:
-            turns = await run_case(case, pack, registry, llm)
+            turns = await run_case(
+                case,
+                pack,
+                registry,
+                llm,
+                embeddings=embeddings,
+                knowledge_store=knowledge_store,
+                auto_rag_min_sim=settings.auto_rag_min_sim,
+            )
             outcomes.append(evaluate_case(case, turns, pack_tool_names))
             # Write after every case so a killed/interrupted run still leaves usable partial
             # results instead of nothing (this suite can take 10-20+ minutes on a throttled
@@ -168,6 +301,9 @@ async def _main_async(args: argparse.Namespace) -> int:
             report = _render_report(args.pack, args.suite, llm_spec, mode, outcomes, accuracy)
             report_path.write_text(report, encoding="utf-8")
             print(f"[{len(outcomes)}/{len(cases) * args.repeat}] {case['id']} done", flush=True)
+
+    if knowledge_store is not None and hasattr(knowledge_store, "close"):
+        await knowledge_store.close()
 
     accuracy = tool_selection_accuracy(outcomes)
     print(f"mode={mode} suite={args.suite} cases={len(cases)} repeat={args.repeat}")

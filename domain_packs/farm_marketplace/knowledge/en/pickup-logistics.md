@@ -4,7 +4,7 @@ title: Pickup and transport
 domain: logistics
 language: en-IN
 version: 1
-status: draft            # SAMPLE — replace with the real rules, then set active
+status: active
 effective_from: 2026-09-01
 audience: farmer
 ---

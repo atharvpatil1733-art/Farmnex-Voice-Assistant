@@ -20,7 +20,7 @@ _STRUCTURAL_KEYS = (
     "confirmed_via",
     "pending_status",
 )
-_EXCLUDE_IF_PRESENT = ("knowledge_used",)
+_EXCLUDE_IF_PRESENT: tuple[str, ...] = ()
 
 _SCHEMA_LEAK_TOKENS = (
     "additionalProperties",
@@ -175,7 +175,13 @@ def evaluate_case(
         content("must_contain_any", any(s in last.reply_text for s in expect["must_contain_any"]))
 
     if "knowledge_used" in expect:
-        content("knowledge_used", False, "no knowledge base until M2")
+        expected_slugs = set(expect["knowledge_used"])
+        actual_slugs = {slug for turn in turns for slug in turn.knowledge_used}
+        content(
+            "knowledge_used",
+            expected_slugs.issubset(actual_slugs),
+            f"expected {expected_slugs} in {actual_slugs}",
+        )
 
     if "no_success_claim" in expect:
         success_words = ("हो गई", "झाले आहे", "झाली आहे", "done", "successfully", "accepted")

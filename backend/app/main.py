@@ -10,6 +10,8 @@ from voice_core.adapters.fakes.auth import FakeAuthVerifier
 from voice_core.adapters.fakes.llm import FakeLLM
 from voice_core.config import Settings, get_settings
 from voice_core.packs.loader import load_pack
+from voice_core.ports.embeddings import EmbeddingProvider
+from voice_core.ports.knowledge import KnowledgeStore
 from voice_core.ports.llm import LLMProvider
 from voice_core.ports.types import Principal
 from voice_core.tools.handlers.mock import MockToolHandler
@@ -30,6 +32,29 @@ def _build_llm(settings: Settings) -> LLMProvider:
     return FakeLLM()
 
 
+def _build_embeddings(settings: Settings) -> EmbeddingProvider | None:
+    if settings.embedding_provider == "gemini":
+        from voice_core.adapters.gemini.embeddings import GeminiEmbedding
+
+        return GeminiEmbedding(api_key=settings.llm_api_key, dim=settings.embedding_dim)
+    if settings.embedding_provider == "fake":
+        from voice_core.adapters.fakes.embeddings import FakeEmbedding
+
+        return FakeEmbedding(dim=settings.embedding_dim)
+    return None
+
+
+def _build_knowledge_store(settings: Settings) -> KnowledgeStore | None:
+    if not settings.database_url:
+        return None
+    from voice_core.adapters.supabase.store import SupabaseKnowledgeStore
+
+    return SupabaseKnowledgeStore(
+        database_url=settings.database_url,
+        statement_cache_size=settings.db_statement_cache_size,
+    )
+
+
 def _build_auth_verifier(settings: Settings) -> FakeAuthVerifier:
     if settings.app_env != "dev":
         raise RuntimeError(
@@ -46,13 +71,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     packs_root = (backend_dir / settings.domain_packs_dir).resolve()
 
     pack = load_pack(settings.domain_pack, packs_root)
+    embeddings = _build_embeddings(settings)
+    knowledge_store = _build_knowledge_store(settings)
+
     app.state.pack = pack
-    app.state.registry = ToolRegistry(pack)
+    app.state.registry = ToolRegistry(pack, embeddings=embeddings, knowledge_store=knowledge_store)
     app.state.tool_handler = MockToolHandler(pack.pack_dir)
     app.state.llm = _build_llm(settings)
+    app.state.embeddings = embeddings
+    app.state.knowledge_store = knowledge_store
+    app.state.auto_rag_min_sim = settings.auto_rag_min_sim
     app.state.auth_verifier = _build_auth_verifier(settings)
 
     yield
+
+    if knowledge_store is not None:
+        await knowledge_store.close()  # type: ignore[attr-defined]
 
 
 app = FastAPI(title="voice-core", lifespan=lifespan)

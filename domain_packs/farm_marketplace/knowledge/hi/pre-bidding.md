@@ -4,7 +4,7 @@ title: प्री-बिडिंग
 domain: pre_bidding
 language: hi-IN
 version: 1
-status: draft            # SAMPLE — असली नियम डालकर active करें
+status: active
 effective_from: 2026-09-01
 audience: farmer
 ---

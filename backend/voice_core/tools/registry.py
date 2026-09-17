@@ -5,11 +5,23 @@ from dataclasses import dataclass
 from typing import Any
 
 from voice_core.packs.loader import LoadedPack
+from voice_core.ports.embeddings import EmbeddingProvider
 from voice_core.ports.host import HostToolHandler
+from voice_core.ports.knowledge import KnowledgeStore
 from voice_core.ports.types import ToolContext, ToolDef, ToolResult, ToolSpec
 from voice_core.tools.schema import assert_no_identity_fields, validate_args
 
 CoreHandler = Callable[[dict[str, Any], ToolContext], Awaitable[ToolResult]]
+
+_SEARCH_KNOWLEDGE_PARAMS = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["query"],
+    "properties": {
+        "query": {"type": "string"},
+        "domain": {"type": "string"},
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -33,55 +45,12 @@ class CoreTool:
     handler: CoreHandler
 
 
-async def _search_knowledge(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-    # Stub for M1; wired to a real KnowledgeStore in M2.
-    return ToolResult(status="ok", data={"chunks": []})
-
-
 async def _set_preferred_language(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     return ToolResult(status="ok", data={"language": args["language"]})
 
 
 async def _end_conversation(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     return ToolResult(status="ok")
-
-
-def _core_tools(languages: tuple[str, ...]) -> tuple[CoreTool, ...]:
-    return (
-        CoreTool(
-            name="search_knowledge",
-            description="Search the app's curated help content for how-to questions.",
-            params={
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["query"],
-                "properties": {
-                    "query": {"type": "string"},
-                    "domain": {"type": "string"},
-                },
-            },
-            handler=_search_knowledge,
-        ),
-        CoreTool(
-            name="set_preferred_language",
-            description=(
-                "Switch the language the assistant replies in for the rest of this conversation."
-            ),
-            params={
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["language"],
-                "properties": {"language": {"type": "string", "enum": list(languages)}},
-            },
-            handler=_set_preferred_language,
-        ),
-        CoreTool(
-            name="end_conversation",
-            description="End the conversation when the user is done and says goodbye.",
-            params={"type": "object", "additionalProperties": False, "properties": {}},
-            handler=_end_conversation,
-        ),
-    )
 
 
 def _find_matching_records(data: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
@@ -107,8 +76,43 @@ def render_confirm_template(template: str, fields: dict[str, Any]) -> str:
 
 
 class ToolRegistry:
-    def __init__(self, pack: LoadedPack) -> None:
-        self._core_tools: dict[str, CoreTool] = {t.name: t for t in _core_tools(pack.languages)}
+    def __init__(
+        self,
+        pack: LoadedPack,
+        embeddings: EmbeddingProvider | None = None,
+        knowledge_store: KnowledgeStore | None = None,
+    ) -> None:
+        self._pack_id = pack.id
+        self._embeddings = embeddings
+        self._knowledge_store = knowledge_store
+        self._core_tools: dict[str, CoreTool] = {
+            "search_knowledge": CoreTool(
+                name="search_knowledge",
+                description="Search the app's curated help content for how-to questions.",
+                params=_SEARCH_KNOWLEDGE_PARAMS,
+                handler=self._search_knowledge,
+            ),
+            "set_preferred_language": CoreTool(
+                name="set_preferred_language",
+                description=(
+                    "Switch the language the assistant replies in for the rest of "
+                    "this conversation."
+                ),
+                params={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["language"],
+                    "properties": {"language": {"type": "string", "enum": list(pack.languages)}},
+                },
+                handler=_set_preferred_language,
+            ),
+            "end_conversation": CoreTool(
+                name="end_conversation",
+                description="End the conversation when the user is done and says goodbye.",
+                params={"type": "object", "additionalProperties": False, "properties": {}},
+                handler=_end_conversation,
+            ),
+        }
         self._pack_tools: dict[str, PackTool] = {}
 
         for raw in pack.tools:
@@ -207,3 +211,32 @@ class ToolRegistry:
             return dict(args)
 
         return {**_find_matching_records(result.data, args), **args}
+
+    async def _search_knowledge(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        if self._embeddings is None or self._knowledge_store is None:
+            return ToolResult(status="ok", data={"chunks": []})
+
+        from voice_core.kb.retriever import search_knowledge
+
+        domain = args.get("domain")
+        chunks = await search_knowledge(
+            query=args["query"],
+            pack_id=self._pack_id,
+            language=ctx.language,
+            embeddings=self._embeddings,
+            store=self._knowledge_store,
+            domains=[domain] if domain else None,
+        )
+        return ToolResult(
+            status="ok",
+            data={
+                "chunks": [
+                    {
+                        "source": f"{c.doc_slug}@v{c.doc_version}",
+                        "text": c.text,
+                        "similarity": c.similarity,
+                    }
+                    for c in chunks
+                ]
+            },
+        )

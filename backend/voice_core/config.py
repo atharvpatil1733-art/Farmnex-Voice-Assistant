@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     sarvam_api_key: str = ""
 
     # Embeddings
-    embedding_provider: Literal["local", "openai_compat", "fake"] = "fake"
+    embedding_provider: Literal["local", "openai_compat", "gemini", "fake"] = "fake"
     embedding_model: str = "BAAI/bge-m3"
     embedding_dim: int = 1024
     auto_rag_min_sim: float = 0.45

@@ -82,19 +82,27 @@ class Chunk:
 
 @dataclass(frozen=True)
 class KBDocument:
+    pack_id: str
     slug: str
     title: str
     domain: str
     version: int
     language: str
-    status: Literal["active", "retired"]
+    status: Literal["draft", "active", "retired"]
+    content_hash: str
+    audience: str | None = None
+    source_path: str | None = None
+    effective_from: str | None = None  # ISO 8601; None means "now"
 
 
 @dataclass(frozen=True)
 class KBChunk:
+    chunk_index: int
     heading: str
     text: str
     embedding: list[float]
+    embedding_model: str
+    token_count: int = 0
 
 
 @dataclass(frozen=True)

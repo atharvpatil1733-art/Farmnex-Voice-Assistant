@@ -13,6 +13,7 @@ def _turn(
         reply_language="en-IN",
         tools_called=[e["tool"] for e in (tool_results or [])],
         tool_results=tool_results or [],
+        knowledge_used=[],
         pending_action=None,
         pending_write_args=None,
         executed=False,

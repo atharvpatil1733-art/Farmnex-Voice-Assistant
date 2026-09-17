@@ -197,6 +197,52 @@ async def test_max_tool_rounds_cutoff_returns_fallback(pack, registry, ctx) -> N
     assert len(llm.calls) == 4  # MAX_TOOL_ROUNDS
 
 
+async def test_auto_retrieve_injects_knowledge_and_records_it_used(pack, registry, ctx) -> None:
+    from voice_core.adapters.fakes.embeddings import FakeEmbedding
+    from voice_core.adapters.fakes.knowledge import FakeKnowledgeStore
+    from voice_core.ports.types import Chunk
+
+    handler = SpyMockToolHandler(pack.pack_dir)
+    store = FakeKnowledgeStore(
+        [Chunk(doc_slug="pre-bidding-basics", doc_version=1, heading="h", text="t", similarity=0.9)]
+    )
+    llm = FakeLLM([TextDelta(text="Pre-bidding stays open 7 days."), Done(usage=Usage(0, 0))])
+
+    result = await run_text_turn(
+        pack=pack,
+        registry=registry,
+        handler=handler,
+        llm=llm,
+        ctx=ctx,
+        language="en-IN",
+        history=[],
+        user_text="how long is pre-bidding open?",
+        embeddings=FakeEmbedding(dim=4),
+        knowledge_store=store,
+        auto_rag_min_sim=0.45,
+    )
+
+    assert result.knowledge_used == ["pre-bidding-basics"]
+
+
+async def test_no_knowledge_used_without_wiring(pack, registry, ctx) -> None:
+    handler = SpyMockToolHandler(pack.pack_dir)
+    llm = FakeLLM([TextDelta(text="ok"), Done(usage=Usage(0, 0))])
+
+    result = await run_text_turn(
+        pack=pack,
+        registry=registry,
+        handler=handler,
+        llm=llm,
+        ctx=ctx,
+        language="en-IN",
+        history=[],
+        user_text="hello",
+    )
+
+    assert result.knowledge_used == []
+
+
 async def test_set_preferred_language_switches_reply_language(pack, registry, ctx) -> None:
     handler = SpyMockToolHandler(pack.pack_dir)
     llm = SequencedFakeLLM(

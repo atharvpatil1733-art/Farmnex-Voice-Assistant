@@ -24,6 +24,9 @@ def _make_client(llm) -> TestClient:
     app.state.registry = ToolRegistry(pack)
     app.state.tool_handler = MockToolHandler(pack.pack_dir)
     app.state.llm = llm
+    app.state.embeddings = None
+    app.state.knowledge_store = None
+    app.state.auto_rag_min_sim = 0.45
     app.state.auth_verifier = FakeAuthVerifier({"tok": Principal(user_ref="u-1")})
     return TestClient(app)
 

@@ -8,7 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from voice_core.packs.loader import LoadedPack
-from voice_core.ports.types import ChatMessage, ToolResult
+from voice_core.ports.types import ChatMessage, Chunk, ToolResult
 
 _CORE_RULES_TEMPLATE = """You are a voice assistant inside a mobile app. Everything you write \
 will be spoken aloud.
@@ -52,6 +52,13 @@ def tool_result_to_message(tool_name: str, result: ToolResult) -> ChatMessage:
     return wrap_tool_result(tool_name, payload)
 
 
+def wrap_knowledge(chunks: list[Chunk]) -> ChatMessage:
+    body = "\n".join(
+        f'<knowledge source="{c.doc_slug}@v{c.doc_version}">{c.text}</knowledge>' for c in chunks
+    )
+    return ChatMessage(role="system", content=body)
+
+
 def _session_facts(pack: LoadedPack, language: str, now: datetime) -> str:
     local_now = now.astimezone(ZoneInfo(pack.timezone))
     language_name = _LANGUAGE_NAMES.get(language, language)
@@ -67,15 +74,21 @@ def build_prompt(
     history: list[ChatMessage],
     user_text: str,
     now: datetime,
+    knowledge_chunks: list[Chunk] | None = None,
 ) -> RenderedPrompt:
     language_name = _LANGUAGE_NAMES.get(language, language)
     core_rules = _CORE_RULES_TEMPLATE.format(language_name=language_name)
     session_facts = _session_facts(pack, language, now)
 
     static_prefix = core_rules + "\n\n" + pack.persona_template + "\n\n" + session_facts
+    # Excludes knowledge/history/utterance on purpose — those vary every turn by design;
+    # the hash tracks only config that should stay stable across an eval run.
     prompt_hash = hashlib.sha256(static_prefix.encode("utf-8")).hexdigest()
 
-    system_message = ChatMessage(role="system", content=static_prefix)
-    messages = [system_message, *history, ChatMessage(role="user", content=user_text)]
+    messages = [ChatMessage(role="system", content=static_prefix)]
+    if knowledge_chunks:
+        messages.append(wrap_knowledge(knowledge_chunks))
+    messages += history
+    messages.append(ChatMessage(role="user", content=user_text))
 
     return RenderedPrompt(messages=messages, prompt_hash=prompt_hash)

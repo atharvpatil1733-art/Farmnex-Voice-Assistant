@@ -107,6 +107,9 @@ async def chat(
         history=history_messages,
         user_text=req.text,
         pending_write=pending_write,
+        embeddings=request.app.state.embeddings,
+        knowledge_store=request.app.state.knowledge_store,
+        auto_rag_min_sim=request.app.state.auto_rag_min_sim,
     )
 
     pending_turn = None

@@ -11,9 +11,19 @@ from voice_core.agent.prompt import build_prompt, tool_result_to_message
 from voice_core.i18n.strings import CANCELLATION_ACK, LLM_FAILURE, TOOL_ROUND_CUTOFF
 from voice_core.i18n.strings import get as i18n_get
 from voice_core.packs.loader import LoadedPack
+from voice_core.ports.embeddings import EmbeddingProvider
 from voice_core.ports.host import HostToolHandler
+from voice_core.ports.knowledge import KnowledgeStore
 from voice_core.ports.llm import LLMProvider
-from voice_core.ports.types import ChatMessage, Done, LLMError, TextDelta, ToolCall, ToolContext
+from voice_core.ports.types import (
+    ChatMessage,
+    Chunk,
+    Done,
+    LLMError,
+    TextDelta,
+    ToolCall,
+    ToolContext,
+)
 from voice_core.tools.registry import ToolRegistry, render_confirm_template
 
 MAX_TOOL_ROUNDS = 4
@@ -79,6 +89,7 @@ class TurnResult:
     reply_language: str
     tools_called: list[str]
     tool_results: list[dict[str, Any]]
+    knowledge_used: list[str]
     pending_action: str | None
     pending_write_args: dict[str, Any] | None
     executed: bool
@@ -94,12 +105,14 @@ def _empty_result(
     prompt_hash: str,
     tools_called: list[str],
     tool_results: list[dict[str, Any]],
+    knowledge_used: list[str],
 ) -> TurnResult:
     return TurnResult(
         reply_text=reply_text,
         reply_language=language,
         tools_called=tools_called,
         tool_results=tool_results,
+        knowledge_used=knowledge_used,
         pending_action=None,
         pending_write_args=None,
         executed=False,
@@ -121,6 +134,9 @@ async def run_text_turn(
     history: list[ChatMessage],
     user_text: str,
     pending_write: PendingWrite | None = None,
+    embeddings: EmbeddingProvider | None = None,
+    knowledge_store: KnowledgeStore | None = None,
+    auto_rag_min_sim: float = 0.45,
     llm_temperature: float = 0.2,
     llm_max_tokens: int = 800,
     llm_timeout_s: float = 20.0,
@@ -133,6 +149,7 @@ async def run_text_turn(
                 reply_language=language,
                 tools_called=[],
                 tool_results=[],
+                knowledge_used=[],
                 pending_action=None,
                 pending_write_args=None,
                 executed=False,
@@ -157,6 +174,7 @@ async def run_text_turn(
                 tool_results=[
                     {"tool": pending_write.tool, "data": result.data, "args": pending_write.args}
                 ],
+                knowledge_used=[],
                 pending_action=None,
                 pending_write_args=None,
                 executed=(result.status == "ok"),
@@ -167,7 +185,23 @@ async def run_text_turn(
             )
         # Neither yes nor no: fall through to the LLM with the pending stub still in `history`.
 
-    rendered = build_prompt(pack, language, history, user_text, datetime.now(tz=UTC))
+    knowledge_chunks: list[Chunk] = []
+    if embeddings is not None and knowledge_store is not None:
+        from voice_core.kb.retriever import auto_retrieve
+
+        knowledge_chunks = await auto_retrieve(
+            query=user_text,
+            pack_id=pack.id,
+            language=language,
+            embeddings=embeddings,
+            store=knowledge_store,
+            min_similarity=auto_rag_min_sim,
+        )
+    knowledge_used = [f"{c.doc_slug}" for c in knowledge_chunks]
+
+    rendered = build_prompt(
+        pack, language, history, user_text, datetime.now(tz=UTC), knowledge_chunks
+    )
     messages = rendered.messages
     tools_called: list[str] = []
     tool_results: list[dict[str, Any]] = []
@@ -202,6 +236,7 @@ async def run_text_turn(
                 rendered.prompt_hash,
                 tools_called,
                 tool_results,
+                knowledge_used,
             )
 
         if not tool_calls:
@@ -211,6 +246,7 @@ async def run_text_turn(
                 rendered.prompt_hash,
                 tools_called,
                 tool_results,
+                knowledge_used,
             )
 
         messages.append(ChatMessage(role="assistant", content=text_buffer))
@@ -234,6 +270,7 @@ async def run_text_turn(
                 reply_language=current_language,
                 tools_called=tools_called,
                 tool_results=tool_results,
+                knowledge_used=knowledge_used,
                 pending_action=write_call.name,
                 pending_write_args=args,
                 executed=False,
@@ -259,6 +296,7 @@ async def run_text_turn(
                     rendered.prompt_hash,
                     tools_called,
                     tool_results,
+                    knowledge_used,
                 )
 
             messages.append(tool_result_to_message(call.name, result))
@@ -269,4 +307,5 @@ async def run_text_turn(
         rendered.prompt_hash,
         tools_called,
         tool_results,
+        knowledge_used,
     )

@@ -114,3 +114,32 @@ async def test_resolve_confirm_fields_merges_matching_record(
 def test_is_write_distinguishes_read_and_write_tools(registry: ToolRegistry) -> None:
     assert registry.is_write("accept_bid") is True
     assert registry.is_write("get_bids_for_listing") is False
+
+
+async def test_search_knowledge_stub_without_embeddings_or_store(
+    registry: ToolRegistry, handler: MockToolHandler, ctx: ToolContext
+) -> None:
+    result = await registry.dispatch("search_knowledge", {"query": "anything"}, ctx, handler)
+    assert result.status == "ok"
+    assert result.data == {"chunks": []}
+
+
+async def test_search_knowledge_returns_real_chunks_when_wired(
+    pack, handler: MockToolHandler, ctx: ToolContext
+) -> None:
+    from voice_core.adapters.fakes.embeddings import FakeEmbedding
+    from voice_core.adapters.fakes.knowledge import FakeKnowledgeStore
+    from voice_core.ports.types import Chunk
+
+    store = FakeKnowledgeStore(
+        [Chunk(doc_slug="pre-bidding-basics", doc_version=1, heading="h", text="t", similarity=0.9)]
+    )
+    wired_registry = ToolRegistry(pack, embeddings=FakeEmbedding(dim=4), knowledge_store=store)
+
+    result = await wired_registry.dispatch(
+        "search_knowledge", {"query": "how long is bidding open"}, ctx, handler
+    )
+
+    assert result.status == "ok"
+    assert result.data is not None
+    assert result.data["chunks"][0]["source"] == "pre-bidding-basics@v1"

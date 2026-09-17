@@ -3,13 +3,11 @@
 Update after every milestone. Keep it short and factual.
 
 ## Current milestone
-M2 — knowledge (RAG) starting. M1 code is complete and committed to local `main`
-(not yet pushed to `origin/main`); its numeric gate (≥85% tool-selection accuracy) is
-**still unverified**, not failed — see Known issues. Per explicit user direction, M2 is
-starting anyway rather than waiting on infra (rate limits + host memory) to cooperate;
+M2 — knowledge (RAG) code complete, gate blocked on infra (see Known issues). M1's own
+gate (≥85% tool-selection accuracy) also remains unverified for the same reason — see
+Known issues. Per explicit user direction, M2 started before M1's gate was confirmed;
 this is a deliberate deviation from CLAUDE.md's "don't start the next milestone until
-the current gate is true" rule, not an accidental skip. Revisit the M1 gate once a
-clean eval run is possible.
+the current gate is true" rule, not an accidental skip.
 
 ## What works
 - Repo layout under `backend/` per CLAUDE.md: `app/`, `voice_core/{ports,adapters,agent,tools,kb,
@@ -27,12 +25,47 @@ clean eval run is possible.
 - `voice_core/ports/store.py` (`ConversationStore`) is an intentionally empty Protocol — its
   method contract is designed in M3 (confirmation/session persistence), not needed for the
   in-memory M1 text turn loop.
-- `voice_core/kb/`, `voice_core/speech/`, `voice_core/observability/` are still empty packages
-  (M2/M4 work).
-- `search_knowledge` core tool is a stub returning `{"chunks": []}` until M2 wires a real
-  `KnowledgeStore`; `evals/run.py --suite retrieval` refuses to run until then.
-- Only vendor adapter implemented is `voice_core/adapters/gemini/llm.py` (real network, used for
-  the eval "gate" mode); everything else still uses fakes.
+- `voice_core/speech/`, `voice_core/observability/` are still empty packages (M4 work).
+- `search_knowledge` is now wired to a real `KnowledgeStore`/`EmbeddingProvider` when both are
+  configured (M2); falls back to `{"chunks": []}` when either is `None` (e.g. `DATABASE_URL`
+  unset), so M1-only setups keep working unchanged.
+
+## What works (M2)
+- `voice_core/adapters/gemini/embeddings.py` — `GeminiEmbedding` via `gemini-embedding-001`,
+  `output_dimensionality=1024` (matches the migration's `vector(1024)` exactly, no schema change
+  needed), `task_type` mapped from `kind` (query→`RETRIEVAL_QUERY`, document→`RETRIEVAL_DOCUMENT`).
+- `voice_core/adapters/supabase/store.py` — real `KnowledgeStore` over `asyncpg`: `match()` calls
+  `voice.match_chunks`; `publish_document()` retires the previous active version (excluding the
+  row being republished) and upserts document+chunks in one transaction; `get_document_hash()`
+  backs the ingest skip-if-unchanged optimization.
+- `voice_core/kb/chunker.py` — front-matter + `##`-section parsing, sentence-boundary splitting
+  for long sections, `title › heading` chunk prefixing.
+- `voice_core/kb/ingest.py` — CLI (`python -m voice_core.kb.ingest --pack <pack> [--dry-run]
+  [--slug <slug>]`), idempotent (hash-skip), fails loudly on missing front-matter fields.
+- `voice_core/kb/retriever.py` — `search_knowledge()` (explicit) and `auto_retrieve()` (per-turn,
+  gated on `min_similarity`); wired into `agent/loop.py` (auto-inject before `build_prompt`,
+  records `TurnResult.knowledge_used`) and the core `search_knowledge` tool in `tools/registry.py`.
+- `voice_core/agent/prompt.py` — `wrap_knowledge()` renders `<knowledge source="slug@vN">` blocks,
+  inserted after the (hash-excluded) static prefix so per-turn retrieval never perturbs
+  `prompt_hash`.
+- `voice_core/evals/run.py --suite retrieval` — real hit@1/hit@3/MRR runner against
+  `retrieval.jsonl`, markdown report, exits non-zero below the 90% hit@3 gate.
+- `voice_core/ports/types.py` — `KBDocument`/`KBChunk` extended with the fields the real store
+  actually needs (`pack_id`, `content_hash`, `audience`, `source_path`, `effective_from`,
+  `chunk_index`, `embedding_model`); `KnowledgeStore.match()` gained `prefer_language` and a new
+  `get_document_hash()` method (both additive/optional, `FakeKnowledgeStore` updated to match).
+- Supabase project `Farmnex-Voice-Assistant` (`fsiotnbxueovfmnwiwcu`): `0001_voice_core.sql`
+  applied via the Supabase MCP tool — 8 tables in schema `voice`, `pgvector`/`pgcrypto` installed,
+  `match_chunks` RPC created. RLS enabled on every table with no policies yet (expected — the
+  backend connects with a privileged role and bypasses RLS; policies only matter if `voice.*` is
+  ever exposed via the Data API).
+- The 4 sample knowledge docs (`pre-bidding` en/hi, `crop-rescue` en, `pickup-logistics` en) were
+  flipped from `status: draft` to `active` — they were placeholder content marked "SAMPLE, set
+  active before use," and are reasonable enough to ingest for real now rather than block M2 on
+  someone else authoring replacement copy. No Marathi knowledge docs exist yet even though
+  `retrieval.jsonl` has mr-IN questions (r-002, r-005, r-008) — relies entirely on
+  `gemini-embedding-001` cross-lingual retrieval finding the English/Hindi docs; untested until
+  the live retrieval gate runs.
 
 ## What works (M1)
 - `voice_core/agent/loop.py` — `run_text_turn`: prompt → LLM tool-calling loop (max 4 rounds),
@@ -62,6 +95,9 @@ clean eval run is possible.
 | 2026-09-16 | M0 scaffold rebuilt from scratch | Prior session's reported commit `ba95ae1` never existed in git history; `backend/` was absent from the working tree | `git log --all` showed only `202227e`, `1ffdd45` before this change |
 | 2026-09-16 | Fixed `get_my_listings` `result_fields` in `domain_packs/farm_marketplace/tools.yaml` from a flat field list (`listing_ref, crop, quantity_kg, status, bidding_ends_at, harvest_date`) to `[listings]` | The fixture (`fixtures/listings.json`) nests every listing under a top-level `listings` array; `ToolRegistry.dispatch`'s trimming (`voice_core/tools/registry.py`) only keeps *top-level* keys matching `result_fields`, so the old list matched nothing and the LLM always received `{}` for this tool — starving it of data for every case that needed "which listing" (g-013, g-014, g-016, g-020, and indirectly cases that fall back to it via `resolve_for_confirm`) | Confirmed by reading `fixtures/bids.json`/`orders.json`/`pickups.json` (all flat, `result_fields` match) vs `listings.json` (nested); added `tests/test_tool_registry.py::test_dispatch_get_my_listings_returns_nested_listings` as a regression test |
 | 2026-09-16 | Gated `FakeAuthVerifier` in `app/main.py` behind `settings.app_env == "dev"`; non-dev startup now raises `RuntimeError` instead of silently wiring the static `dev-token` bypass | `voice-safety-reviewer` subagent flagged this as a BLOCKER-in-waiting: the code wired `FakeAuthVerifier` unconditionally while a comment claimed it was dev-only — not exploitable today (no real host/writes exist pre-M3) but exactly the kind of thing that survives into M3/M4 by inertia if not fixed now | `backend/tests/test_main.py` covers both branches |
+| 2026-09-18 | Embeddings: `gemini-embedding-001` via `output_dimensionality=1024`, not local `BAAI/bge-m3` (SPEC's default candidate) | Host machine was at ~5% free RAM this session (see M1 known issues); loading a multi-GB local model was too risky, and Gemini's API already matches the migration's `vector(1024)` exactly with no schema change. Verified live: 1024-dim output confirmed, cosine similarity unaffected by non-unit norm since pgvector's `<=>` operator normalizes internally | `voice_core/adapters/gemini/embeddings.py`; manual verification via `client.aio.models.embed_content` before writing the adapter |
+| 2026-09-18 | Flipped the 4 sample knowledge docs from `status: draft` to `active` | They were placeholder content explicitly marked "SAMPLE — replace with the real rules, then set active"; drafts are never retrieved, so the retrieval gate can't be measured at all without activating something. Reasonable enough as real placeholder content for a prototype | `domain_packs/farm_marketplace/knowledge/**/*.md` front matter |
+| 2026-09-18 | `0001_voice_core.sql` applied directly to the live Supabase project via the MCP `apply_migration` tool, not `supabase db push` from a local CLI | No local Supabase CLI session was set up this session; the MCP tool was already available and the migration file was unchanged from what M0/M1 wrote | `mcp__claude_ai_Supabase__list_tables` confirmed all 8 `voice.*` tables afterward |
 
 ## Known issues
 - **The 31.6% gate run is not a reliable signal.** Gemini free-tier quota for `gemini-2.5-flash`
@@ -112,6 +148,14 @@ clean eval run is possible.
   `tests/test_metrics.py`. `no_other_user_data` (rt-002) is still unimplemented — it needs
   pack-level knowledge of what counts as "another user's data," which the current single-user
   mock fixtures don't model; left as a known gap rather than guessed at.
+- **M2's retrieval gate has not been run.** `backend/.env`'s `DATABASE_URL` is still the literal
+  placeholder from `.env.example` (`postgresql://postgres.<project-ref>:<password>@<pooler-host>...`),
+  not a real connection string — confirmed by a `getaddrinfo failed` DNS error when the ingest CLI
+  tried to connect. The Supabase project and migration are ready; someone needs to paste the real
+  transaction-pooler connection string (Project Settings → Database → Connection string) into
+  `backend/.env` before `python -m voice_core.kb.ingest` or `evals/run.py --suite retrieval` can
+  run for real. Everything else (chunker, ingest logic, retriever, Gemini embeddings, the
+  Supabase store adapter, `search_knowledge` wiring) is implemented and unit-tested against fakes.
 - Rate limiting: `Settings.rate_limit_turns_per_min` / `rate_limit_turns_per_day` are declared but
   nothing reads them yet, and `ChatRequest` has no size caps on `text`/`history`. Per CLAUDE.md's
   milestone plan this is explicitly M7 ("Hardening — rate limits...") — intentionally not pulled

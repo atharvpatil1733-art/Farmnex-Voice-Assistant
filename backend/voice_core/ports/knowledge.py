@@ -14,6 +14,11 @@ class KnowledgeStore(Protocol):
         k: int,
         min_similarity: float,
         domains: list[str] | None,
+        prefer_language: str | None = None,
     ) -> list[Chunk]: ...
 
     async def publish_document(self, doc: KBDocument, chunks: list[KBChunk]) -> None: ...
+
+    async def get_document_hash(
+        self, pack_id: str, slug: str, language: str, version: int
+    ) -> str | None: ...
