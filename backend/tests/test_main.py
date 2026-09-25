@@ -78,3 +78,27 @@ def test_free_providers_groq_whisper_and_edge_tts() -> None:
     packs_root = Path(__file__).resolve().parents[2] / "domain_packs"
     # edge picks a female voice per language, so no speaker choice is required even in prod
     assert _choose_speaker(settings, load_pack("farm_marketplace", packs_root)) == "default-female"
+
+
+async def test_warm_up_touches_embeddings_and_store_and_never_raises() -> None:
+    from app.main import _warm_up
+    from voice_core.adapters.fakes.embeddings import FakeEmbedding
+    from voice_core.adapters.fakes.knowledge import FakeKnowledgeStore
+    from voice_core.packs.loader import load_pack
+
+    pack = load_pack("farm_marketplace", Path(__file__).resolve().parents[2] / "domain_packs")
+    calls: list[str] = []
+
+    class Spy(FakeKnowledgeStore):
+        async def match(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append("match")
+            return []
+
+    class Broken(FakeKnowledgeStore):
+        async def match(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            raise ConnectionError("db down")
+
+    await _warm_up(pack, FakeEmbedding(dim=4), Spy())
+    assert calls == ["match"]
+    await _warm_up(pack, FakeEmbedding(dim=4), Broken())  # logged, not raised
+    await _warm_up(pack, FakeEmbedding(dim=4), None)

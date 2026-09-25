@@ -47,7 +47,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 SESSION_START_TIMEOUT_S = 5.0
-FILLER_AFTER_S = 1.2
+# If no answer is ready this long after thinking starts, play the pack's short filler
+# ("one moment..."), pre-synthesized per session so it costs no TTS time (SPEC §6 step 5).
+FILLER_AFTER_S = 0.8
 HISTORY_MESSAGES = 16  # SPEC §5: last 8 turns verbatim
 TTS_CONCURRENCY = 2
 PCM_BYTES_PER_MS = 32  # 16 kHz * 2 bytes / 1000
@@ -97,6 +99,8 @@ class VoiceSession:
         self._audio_too_long = False
         self._open_action_id: str | None = None
         self._resolved_actions: set[str] = set()  # ids already answered with action.result
+        self._filler_audio: dict[str, bytes] = {}  # language -> pre-synthesized filler
+        self._background: set[asyncio.Task[None]] = set()
 
     @property
     def language(self) -> str:
@@ -123,6 +127,8 @@ class VoiceSession:
             pass
         finally:
             await self._interrupt()
+            for task in list(self._background):
+                task.cancel()
             if self._ws.client_state == WebSocketState.CONNECTED:
                 with contextlib.suppress(Exception):
                     await self._ws.close()
@@ -147,6 +153,7 @@ class VoiceSession:
             (lang for lang in (saved, requested) if lang in pack.languages), pack.default_language
         )
         self._tracker = LanguageTracker(language, pack.languages)
+        self._prepare_filler(language)
         self._conversation_id = await self._d.store.create_conversation(
             self._principal.user_ref, pack.id, "app", language
         )
@@ -259,7 +266,28 @@ class VoiceSession:
             await self._error("PROTOCOL_ERROR", i18n.INTERNAL_ERROR, retryable=False)
             return
         self._tracker.set(language)
+        self._prepare_filler(language)
         await self._d.store.set_preferred_language(self._principal.user_ref, language)
+
+    def _prepare_filler(self, language: str) -> None:
+        """Synthesize the filler for this language in the background (best-effort)."""
+        text = self._d.pack.fillers.get(language)
+        if not text or language in self._filler_audio:
+            return
+
+        async def synthesize() -> None:
+            try:
+                spoken = normalize_for_speech(text, language, units=self._d.pack.speech_units)
+                segment = await self._d.tts.synthesize(
+                    spoken, language, self._d.speaker, self._d.pace
+                )
+                self._filler_audio[language] = segment.data
+            except Exception:
+                logger.warning("filler_prepare_failed", exc_info=True)
+
+        task = asyncio.create_task(synthesize())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     # ------------------------------------------------------------------ turns
 
@@ -324,6 +352,7 @@ class _Turn:
         self.spoken: list[str] = []
         self.filler: asyncio.Task[None] | None = None
         self.filler_played = False
+        self.answer_audio_sent = False
         self.stt_confidence: float | None = None
         self.reply_text: str | None = None
         self.reply_language: str | None = None
@@ -417,6 +446,8 @@ class _Turn:
         except Exception:
             logger.warning("transcript_persist_failed", exc_info=True)  # best-effort
         await self.s._send(p.State(value="thinking"))
+        if not self.filler_played and self.filler is None:
+            self.filler = asyncio.create_task(self._filler_after_delay())
         language_before = self.s.language
         with self.timer.span("llm"):
             result = await run_text_turn(
@@ -472,18 +503,21 @@ class _Turn:
         if self.d.registry.has_pack_tool(name):
             label = self.d.registry.get(name).display_hint.get(self.s.language)
         await self.s._send(p.ToolActivity(turn_id=self.turn_id, phase=phase, label=label))
-        if phase == "started" and not self.filler_played and self.filler is None:
-            self.filler = asyncio.create_task(self._filler_after_delay())
-        elif phase == "finished" and self.filler is not None and not self.filler_played:
-            self.filler.cancel()
-            self.filler = None
 
     async def _filler_after_delay(self) -> None:
         await asyncio.sleep(FILLER_AFTER_S)
-        text = self.d.pack.fillers.get(self.s.language)
-        if text and not self.muted:
-            self.filler_played = True
-            await self._speak([text], final=False)
+        language = self.s.language
+        text = self.d.pack.fillers.get(language)
+        if not text or self.muted:
+            return
+        self.filler_played = True
+        cached = self.s._filler_audio.get(language)
+        if cached is None:
+            await self._speak([text], final=False)  # not ready yet: synthesize now (slower)
+            return
+        await self.s._send(p.State(value="speaking"))
+        await self._send_segment(cached, is_last=False)
+        self.spoken.append(text)
 
     async def _deliver(self, result: TurnResult, user_text: str | None) -> None:
         language = result.reply_language
@@ -540,6 +574,21 @@ class _Turn:
             )
         )
 
+    async def _send_segment(self, data: bytes, *, is_last: bool) -> None:
+        await self.s._send(
+            p.AudioSegmentHeader(
+                turn_id=self.turn_id,
+                seq=self.seq,
+                encoding=self.d.audio_out_encoding,
+                sample_rate=self.d.audio_out_sample_rate,
+                byte_length=len(data),
+                is_last=is_last,
+            ),
+            audio=data,
+        )
+        self.seq += 1
+        self.timer.mark("first_audio_total")
+
     async def _speak(
         self, sentences: list[str], *, final: bool, language: str | None = None
     ) -> None:
@@ -575,7 +624,7 @@ class _Turn:
             for index, (text, task) in enumerate(zip(spoken, tasks, strict=True)):
                 if self.muted:
                     break
-                first = self.seq == 0
+                first = final and not self.answer_audio_sent
                 try:
                     if first:
                         with self.timer.span("tts_first_audio"):
@@ -603,6 +652,9 @@ class _Turn:
                 self.seq += 1
                 self.spoken.append(text)
                 self.timer.mark("first_audio_total")
+                if final:
+                    self.answer_audio_sent = True
+                    self.timer.mark("first_answer_audio")  # the real answer, not the filler
         finally:
             for task in tasks:
                 task.cancel()

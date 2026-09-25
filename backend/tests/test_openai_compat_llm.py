@@ -244,3 +244,27 @@ async def test_single_attempt_mode_fails_fast_on_rate_limit() -> None:
     ]
     assert attempts["n"] == 1
     assert isinstance(events[-1], LLMError) and events[-1].code == "rate_limited"
+
+
+async def test_reasoning_effort_is_sent_only_when_configured() -> None:
+    bodies: list[dict[str, object]] = []
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        bodies.append(json.loads(request.content))
+        return _completion_response(content="ok")
+
+    for effort in (None, "low"):
+        llm = OpenAICompatLLM(
+            api_key="k",
+            model="openai/gpt-oss-20b",
+            base_url="https://api.example/v1",
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+            reasoning_effort=effort,
+        )
+        async for _ in llm.stream(
+            [ChatMessage(role="user", content="hi")], [], temperature=0.0, max_tokens=5, timeout_s=5
+        ):
+            pass
+    assert "reasoning_effort" not in bodies[0]
+    assert bodies[1]["reasoning_effort"] == "low"
+    assert bodies[1]["include_reasoning"] is False

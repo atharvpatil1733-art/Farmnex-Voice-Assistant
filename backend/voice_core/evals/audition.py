@@ -74,10 +74,11 @@ async def _main(args: argparse.Namespace) -> int:
                 except Exception as exc:  # report and continue with the next voice
                     cells.append(f"failed: {type(exc).__name__}")
                     continue
-                path = out / speaker / f"{language}.wav"
+                ext = "mp3" if segment.fmt.startswith("mp3") else "wav"
+                path = out / speaker / f"{language}.{ext}"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(segment.data)
-                cells.append(f"[{language}]({speaker}/{language}.wav)")
+                cells.append(f"[{language}]({speaker}/{language}.{ext})")
             rows.append(f"| {speaker} | " + " | ".join(cells) + " |")
             print(f"{speaker}: done")
     finally:

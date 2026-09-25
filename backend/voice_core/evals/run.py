@@ -47,6 +47,9 @@ def _build_chain_provider(entry_provider: str, model: str, settings: Settings) -
             model=model,
             base_url=settings.groq_base_url,
             max_attempts=1,
+            reasoning_effort=(
+                settings.llm_reasoning_effort if model.startswith("openai/gpt-oss") else None
+            ),
         )
     raise ValueError(f"unknown provider {entry_provider!r} in LLM_FALLBACK_CHAIN")
 

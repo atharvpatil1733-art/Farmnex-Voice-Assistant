@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     groq_api_key: str = ""
     groq_base_url: str = "https://api.groq.com/openai/v1"
+    # For Groq gpt-oss reasoning models: "low" is faster and sends back no reasoning text
+    # (fewer tokens against the free tier's 8K tokens/min); same tool choices in our test.
+    llm_reasoning_effort: str = "low"
 
     # STT / TTS
     stt_provider: Literal["sarvam", "groq", "fake"] = "fake"

@@ -212,7 +212,9 @@ def test_voice_read_turn_runs_the_full_pipeline_in_order() -> None:
     assert types == expected_order
     final = next(m for m in messages if m["type"] == "assistant.text.final")
     assert final["text"] == "सबसे ऊँची बोली ₹27/kg है। पुणे के खरीदार की है।"  # captions keep symbols
-    assert tts.texts == ["सबसे ऊँची बोली 27 रुपये किलो है।", "पुणे के खरीदार की है।"]  # TTS doesn't
+    filler = "एक सेकंड, देख रही हूँ।"  # pre-synthesized once per session, in the background
+    reply_tts = [t for t in tts.texts if t != filler]
+    assert reply_tts == ["सबसे ऊँची बोली 27 रुपये किलो है।", "पुणे के खरीदार की है।"]  # TTS doesn't
     segments = [m for m in messages if m["type"] == "audio.segment"]
     assert [s["seq"] for s in segments] == [0, 1]
     assert [s["is_last"] for s in segments] == [False, True]
@@ -494,3 +496,36 @@ def test_mp3_tts_is_announced_and_labelled() -> None:
     assert ready["audio_out"] == {"encoding": "mp3", "sample_rate": 24000}
     segment = next(m for m in messages if m["type"] == "audio.segment")
     assert (segment["encoding"], segment["sample_rate"]) == ("mp3", 24000)
+
+
+class SlowLLM(SequencedLLM):
+    async def stream(self, messages, tools, *, temperature, max_tokens, timeout_s):  # type: ignore[no-untyped-def]
+        await asyncio.sleep(0.4)
+        async for event in super().stream(
+            messages, tools, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s
+        ):
+            yield event
+
+
+def test_slow_answer_gets_the_cached_filler_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ws_module, "FILLER_AFTER_S", 0.1)
+    client, _, tts = _make(stt=ScriptedSTT(_t("नमस्ते")), llm=SlowLLM(_reply("नमस्ते जी।")))
+    with client.websocket_connect("/v1/voice") as ws:
+        _start(ws)
+        _speak(ws)
+        messages, audio = _collect_turn(ws)
+    segments = [m for m in messages if m["type"] == "audio.segment"]
+    assert [s["is_last"] for s in segments] == [False, True]  # filler, then the answer
+    assert audio[0] == "wav:एक सेकंड, देख रही हूँ।".encode()
+    assert tts.texts.count("एक सेकंड, देख रही हूँ।") == 1  # synthesized once, reused
+    latency = next(m for m in messages if m["type"] == "turn.end")["latency_ms"]
+    assert latency["first_audio_total"] < latency["first_answer_audio"]
+
+
+def test_fast_answer_plays_no_filler() -> None:
+    client, _, _ = _make(stt=ScriptedSTT(_t("नमस्ते")), llm=SequencedLLM(_reply("नमस्ते जी।")))
+    with client.websocket_connect("/v1/voice") as ws:
+        _start(ws)
+        _speak(ws)
+        messages, _ = _collect_turn(ws)
+    assert len([m for m in messages if m["type"] == "audio.segment"]) == 1

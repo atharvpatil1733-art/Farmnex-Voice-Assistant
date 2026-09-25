@@ -66,3 +66,14 @@ def test_chain_links_are_built_single_attempt() -> None:
     settings = Settings(gemini_api_key="g", groq_api_key="q")
     assert _build_chain_provider("gemini", "gemini-2.5-flash", settings)._max_attempts == 1
     assert _build_chain_provider("groq", "openai/gpt-oss-20b", settings)._max_attempts == 1
+
+
+def test_groq_gpt_oss_links_use_configured_reasoning_effort() -> None:
+    from app.main import _build_chain_provider
+    from voice_core.config import Settings
+
+    settings = Settings(groq_api_key="q", llm_reasoning_effort="low")
+    link = _build_chain_provider("groq", "openai/gpt-oss-20b", settings)
+    assert link._extra_body == {"reasoning_effort": "low", "include_reasoning": False}
+    other = _build_chain_provider("groq", "llama-3.3-70b-versatile", settings)
+    assert other._extra_body is None

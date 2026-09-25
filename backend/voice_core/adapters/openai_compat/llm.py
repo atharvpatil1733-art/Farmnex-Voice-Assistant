@@ -81,7 +81,14 @@ class OpenAICompatLLM:
         base_url: str,
         http_client: httpx2.AsyncClient | None = None,
         max_attempts: int = _MAX_ATTEMPTS,
+        reasoning_effort: str | None = None,
     ) -> None:
+        # Reasoning models (e.g. Groq's gpt-oss): "low" trades some deliberation for latency.
+        self._extra_body: dict[str, object] | None = (
+            {"reasoning_effort": reasoning_effort, "include_reasoning": False}
+            if reasoning_effort
+            else None
+        )
         # 1 inside a fallback chain: the chain is the retry, don't sleep out rate limits.
         self._max_attempts = max(1, max_attempts)
         if http_client is None:
@@ -115,6 +122,7 @@ class OpenAICompatLLM:
                     tools=oa_tools or None,  # type: ignore[arg-type]
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    extra_body=self._extra_body,
                 )
             except APITimeoutError as exc:
                 yield LLMError(code="timeout", message=str(exc), retryable=True)

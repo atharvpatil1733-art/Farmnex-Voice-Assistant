@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ from voice_core.adapters.sarvam.tts import SarvamTTS
 from voice_core.adapters.supabase.conversation import SupabaseConversationStore
 from voice_core.config import Settings, get_settings
 from voice_core.packs.loader import LoadedPack, load_pack
+from voice_core.ports.embeddings import EmbeddingProvider
 from voice_core.ports.knowledge import KnowledgeStore
 from voice_core.ports.llm import LLMProvider
 from voice_core.ports.store import ConversationStore
@@ -59,6 +61,9 @@ def _build_chain_provider(entry_provider: str, model: str, settings: Settings) -
             model=model,
             base_url=settings.groq_base_url,
             max_attempts=1,
+            reasoning_effort=(
+                settings.llm_reasoning_effort if model.startswith("openai/gpt-oss") else None
+            ),
         )
     raise ValueError(f"unknown provider {entry_provider!r} in LLM_FALLBACK_CHAIN")
 
@@ -192,6 +197,28 @@ def _build_speech(settings: Settings) -> Speech:
     return Speech(stt, FakeTTS(), "wav", 22_050, closers)
 
 
+async def _warm_up(
+    pack: LoadedPack, embeddings: EmbeddingProvider, knowledge_store: KnowledgeStore | None
+) -> None:
+    """Open the DB pool and embedding client before the first user turn (measured: the first
+    retrieval took 5.8 s cold vs 1.2 s warm). Best-effort: a failure only means a slower turn."""
+    if knowledge_store is None:
+        return
+    from voice_core.kb.retriever import auto_retrieve
+
+    try:
+        await auto_retrieve(
+            query="warm-up",
+            pack_id=pack.id,
+            language=pack.default_language,
+            embeddings=embeddings,
+            store=knowledge_store,
+            min_similarity=1.0,
+        )
+    except Exception:
+        logger.warning("startup warm-up failed; first turn will be slower", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
@@ -252,7 +279,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         auto_rag_min_sim=settings.auto_rag_min_sim,
     )
 
+    warm_up = asyncio.create_task(_warm_up(pack, embeddings, knowledge_store))
+
     yield
+
+    warm_up.cancel()
 
     if knowledge_store is not None:
         await knowledge_store.close()  # type: ignore[attr-defined]

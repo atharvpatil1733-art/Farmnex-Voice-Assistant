@@ -167,6 +167,12 @@ def write_report(results: list[dict[str, Any]], network: NetworkProfile, reports
     loop_values = [r["first_audio_ms"] for r in results if r["first_audio_ms"] is not None]
     g4_values = [r["first_audio_4g_ms"] for r in results if r["first_audio_4g_ms"] is not None]
     median_4g = statistics.median(g4_values) if g4_values else float("inf")
+    # first_audio may be the filler ("one moment"); the answer's own first audio is reported too.
+    answer_values = [
+        float(r["server"]["first_answer_audio"]) + network.rtt_ms
+        for r in results
+        if "first_answer_audio" in r["server"]
+    ]
     lines = [
         "# Latency report: push-to-talk time to first audio",
         "",
@@ -176,16 +182,20 @@ def write_report(results: list[dict[str, Any]], network: NetworkProfile, reports
         f"{percentile(loop_values, 90):.0f} ms",
         f"- **4G-modelled median / p90: {median_4g:.0f} / {percentile(g4_values, 90):.0f} ms "
         f"— gate ≤ {GATE_MS} ms: {'PASS' if median_4g <= GATE_MS else 'FAIL'}**",
+        f"- first *answer* audio (server-side + RTT) median / p90: "
+        f"{statistics.median(answer_values) if answer_values else 0:.0f} / "
+        f"{percentile(answer_values, 90):.0f} ms",
         "",
-        "| # | lang | first audio (loopback) | 4G model | stt | llm | tts_first | errors "
-        "| transcript |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| # | lang | first audio (loopback) | 4G model | answer audio (server) | stt | llm "
+        "| tts_first | errors | transcript |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for index, r in enumerate(results):
         s = r["server"]
         lines.append(
             f"| {index} | {r['language']} | {r['first_audio_ms'] or 0:.0f} | "
-            f"{r['first_audio_4g_ms'] or 0:.0f} | {s.get('stt', '')} | {s.get('llm', '')} | "
+            f"{r['first_audio_4g_ms'] or 0:.0f} | {s.get('first_answer_audio', '')} | "
+            f"{s.get('stt', '')} | {s.get('llm', '')} | "
             f"{s.get('tts_first_audio', '')} | {','.join(r['errors'])} | {r['transcript'][:60]} |"
         )
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -214,6 +224,7 @@ async def _main(args: argparse.Namespace) -> int:
             )
             results.append(result)
             print(f"[{repeat}] {clip.name}: {result['first_audio_ms'] or 0:.0f} ms loopback")
+            await asyncio.sleep(args.gap_s)  # stay under free-tier tokens-per-minute limits
     path = write_report(results, network, Path(args.reports))
     print(f"report: {path}")
     g4 = [r["first_audio_4g_ms"] for r in results if r["first_audio_4g_ms"] is not None]
@@ -230,6 +241,7 @@ def main() -> None:
     parser.add_argument("--synthesize", action="store_true", help="make clips with Sarvam TTS")
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--turn-timeout-s", type=float, default=180.0)
+    parser.add_argument("--gap-s", type=float, default=0.0, help="pause between turns")
     parser.add_argument("--rtt-ms", type=float, default=120.0)
     parser.add_argument("--downlink-kbps", type=float, default=2_000.0)
     parser.add_argument("--reports", default="evals/reports")
