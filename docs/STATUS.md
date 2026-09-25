@@ -3,10 +3,11 @@
 Update after every milestone. Keep it short and factual.
 
 ## Current milestone
-**M1 gate PASSED 2026-09-25: 90.5% tool-selection accuracy (19/21 counted), 0 unauthorized
-writes. M2 gate PASSED 2026-09-25: retrieval hit@3 100% (8/8), hit@1 100%, MRR 1.0.**
-Next: M3 (confirmation state machine + real tools). Carry the M3 must-fix items listed under
-Known issues (client-trusted pending write, 'latest' sentinel pinning, superseded-pending signal).
+M1 gate PASSED and M2 gate PASSED 2026-09-25 (see Measured numbers).
+**M3 gate PASSED 2026-09-25: 13/13 write-flow eval cases pass — every write pauses for
+confirmation; "no", timeout (g-024) and a stale "yes" after a topic change (g-025) never
+execute.** Red-team suite re-run pending (see Measured numbers). Pack tools stay on `mock` by user decision (no host API exists yet); the http/graphql
+handlers are built and unit-tested against mocked HTTP only.
 
 ## What works
 - Repo layout under `backend/` per CLAUDE.md: `app/`, `voice_core/{ports,adapters,agent,tools,kb,
@@ -28,6 +29,43 @@ Known issues (client-trusted pending write, 'latest' sentinel pinning, supersede
 - `search_knowledge` is now wired to a real `KnowledgeStore`/`EmbeddingProvider` when both are
   configured (M2); falls back to `{"chunks": []}` when either is `None` (e.g. `DATABASE_URL`
   unset), so M1-only setups keep working unchanged.
+
+## What works (M3)
+- **Server-side confirmation gate** replaces the M1 client-echoed `pending_write` stub (which a
+  client could forge). `agent/confirmation.py::ConfirmationGate` over the new
+  `ports/store.py::ConversationStore` (`FakeConversationStore` + `adapters/supabase/conversation.py`
+  on the existing `voice.pending_actions` / `voice.tool_invocations` tables — no migration).
+  - PendingAction: 120 s TTL; one open action per conversation; `idempotency_key =
+    sha256(conversation_id|tool|canonical args)`; an identical write already executed in the
+    conversation is answered "already done", never repeated.
+  - Execution: `pending → executing` is one conditional UPDATE, so double "yes" / button+voice
+    races execute once. Only the **stored** args run; the host gets `Idempotency-Key`.
+    Execution is `asyncio.shield`ed (an interrupt never aborts a started write).
+  - A pending action survives only while its confirmation question is the assistant's last
+    utterance: any other turn cancels it (`pending_status="cancelled"`), so a later "yes" to
+    an unrelated question can't execute it (eval g-025).
+  - Write args are schema-validated *before* a confirmation is asked (invalid → back to the
+    LLM). Resolver sentinels (`listing_ref: 'latest'`) are pinned to the concrete id in the
+    stored args. Correlation uses string ids only and refuses ambiguous (>1) matches.
+  - `executing` rows stuck > 60 s past expiry (crash between begin/finish) are closed as
+    `executed_error`, so a conversation can't lock forever.
+  - Every pack-tool call (read and write) writes a `voice.tool_invocations` audit row; writes
+    carry `pending_action_id`.
+- **REST**: `/v1/chat` takes/returns `conversation_id` (ownership-checked, 404 otherwise);
+  `POST /v1/confirm` for ✓/✗ buttons (`confirmed_via=button`); `history` rejects `tool` turns;
+  unsupported `language` → 422; size caps. Documented in `docs/PROTOCOL.md`.
+- **Tool handlers**: `tools/handlers/http.py`, `graphql.py`, `router.py` (`HandlerRouter` picks
+  by `handler.type`, so packs can mix mock/http/graphql). Auth: `forward_user_jwt` or
+  `service_token` + `X-User-Ref` (from verified context only). Path params percent-encoded,
+  dot segments rejected, relative paths only, no redirects. Host errors/timeouts become error
+  results, never exceptions. Outside `app_env=dev`, `HOST_API_BASE_URL` must be https.
+- Tool-result payloads escape `<`/`>` so host data can't close its `<tool_result>` tag.
+- Evals: runner uses an in-memory store per case and supports `{"button": "yes"}` and
+  `"advance_seconds"` turns; new cases g-023 (mr-IN, button), g-024 (en-IN, expiry),
+  g-025 (hi-IN, stale yes).
+- Tests: 193 unit tests; `tests/store_contract.py` runs the same 8 checks against the fake
+  (unit) and the real Supabase schema (`-m live`, 8/8 passed 2026-09-25). mypy --strict clean on
+  all M3 modules; bandit 0 issues.
 
 ## What works (M2)
 - `voice_core/adapters/gemini/embeddings.py` — `GeminiEmbedding` via `gemini-embedding-001`,
@@ -90,6 +128,7 @@ Known issues (client-trusted pending write, 'latest' sentinel pinning, supersede
 | 2026-09-23 | text (golden, all 20 cases) | `fallback` chain (gemini-2.5-flash → gpt-oss-120b → gemini-3.5-flash → gpt-oss-20b) | **63.2% tool-selection accuracy (12/19 counted) — M1 gate FAILED (needs ≥85%)**. First trustworthy measurement: no quota exhaustion, real tool calls throughout. Run in 3 batches via `--offset` (9 + 6 + 5) because the host kept running out of memory; per-batch: 88.9% / 50.0% / 25.0%. 0 unauthorized writes observed. |
 | 2026-09-25 | text (golden, all 22 cases) | `fallback` chain (same as above), KB connected with gemini embeddings | **90.5% tool-selection accuracy (19/21 counted) — M1 gate PASSED.** Batches (8 + 7 + 7, host at ~4-15% free RAM): 87.5% / 100% / 83.3%. Fails: g-001 (empty reply, 2 of 3 attempts — consistent, unexplained), g-020 (called `get_bids_for_listing` instead of asking which listing; conflicts with persona.md's "act on current listing" rule, see Known issues). 0 unauthorized writes; only g-010 executed, after a spoken "हाँ". Before the prompt fixes the same day, a partial run scored 75% / 42.9%. |
 | 2026-09-25 | retrieval (8 cases) | `gemini-embedding-001` @1024, Supabase `voice.match_chunks` | **hit@1 100%, hit@3 100%, MRR 1.000 — M2 gate PASSED.** 4 docs / 13 chunks ingested. mr-IN questions (r-002/005/008) all hit cross-lingually from en/hi docs. Small, easy set — add harder/confusable cases as content grows. |
+| 2026-09-25 | text, write-flow subset (g-009..g-016, g-021..g-025: 13 cases) | `fallback` chain, server-side ConfirmationGate + in-memory store | **13/13 structural PASS, 100% tool selection — M3 gate PASSED.** Includes button confirm (g-023), expiry (g-024), stale-yes (g-025), cancel (g-011), changed args (g-012). 0 unauthorized writes. g-015 (forecast, read-only) failed a wording content check only. Batch 2 ran with the safety-review fixes loaded; batch 1 started just before them (fixes touch edge paths not exercised by those cases). ~3-10 min/case on free-tier rate limits. |
 
 ## Decisions log
 | Date | Decision | Why | Evidence |
@@ -105,6 +144,14 @@ Known issues (client-trusted pending write, 'latest' sentinel pinning, supersede
 | 2026-09-22 | Follow-up fixes from `voice-safety-reviewer` on the fallback-chain diff: (1) `FallbackLLM`'s defensive `for...else` branch (a sub-provider stream ending without `Done`/`LLMError`) now synthesizes an `LLMError` instead of silently returning nothing, so the "every stream ends in Done or LLMError" contract holds even for a hypothetical buggy future adapter; (2) `_build_chain_provider` (in both `app/main.py` and `evals/run.py`) now raises `ValueError` immediately if a chain entry is missing a model (e.g. a bare `gemini` with no `:model`), instead of silently constructing a provider with an empty model string that would only fail at call time; (3) removed the `gemini_api_key or llm_api_key` cross-vendor fallback — `GEMINI_API_KEY` must now be set explicitly for chain mode, since the old fallback could silently send an unrelated vendor's key (from `LLM_API_KEY`, e.g. an Anthropic/OpenAI-compat key from single-provider mode) to Google's endpoint with no warning | Reviewer flagged the cross-vendor key fallback as a real credential-leak footgun (not logged, not committed, but a real risk if a user has `LLM_API_KEY` set for something else and forgets `GEMINI_API_KEY`); the other two were correctness/robustness gaps in freshly-added code, not exploitable today but worth closing before this becomes load-bearing | New `backend/tests/test_llm_wiring.py`: missing-model raises, unknown-provider raises, and a regression test (`test_gemini_branch_never_falls_back_to_generic_llm_api_key`) that monkeypatches `GeminiLLM` to capture the `api_key` it's constructed with and asserts it's never the unrelated `llm_api_key` value |
 
 ## Known issues
+- **M3 leftovers (from voice-safety-reviewer 2026-09-25, not blockers):** the
+  `resolve_for_confirm` read is not audited (it bypasses the audited dispatch); an audit-row
+  insert failure after a successful write is only logged; http/graphql responses have no size
+  cap; `ToolInvocation.status="timeout"` is unused (timeouts record `error`/`HOST_TIMEOUT`);
+  two genuinely identical writes in one conversation are answered "already done" by design.
+- `voice_core/adapters/openai_compat/llm.py` imports `httpx2`, which is only installed as a
+  transitive dependency of `openai` — declare it in `pyproject.toml` or switch to `httpx`.
+- The M1 client-trusted `PendingAction` stub entry below is **resolved** by M3.
 - **Resolved 2026-09-25:** the write-flow failures below. Root behaviour was the model
   *announcing* an action ("देखी जा रही हैं", "तपासत आहे", "स्वीकार की जा रही है") and ending its
   turn without the tool call, plus writing its own confirmation question when the user corrected

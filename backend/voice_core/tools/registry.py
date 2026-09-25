@@ -54,19 +54,39 @@ async def _end_conversation(args: dict[str, Any], ctx: ToolContext) -> ToolResul
     return ToolResult(status="ok")
 
 
-def _find_matching_records(data: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
-    """Generic correlation for resolve_for_confirm: for each write-tool arg, look for a
-    same-named field inside any nested list-of-dicts in the resolved data and merge the
-    matching item's fields in. Stays domain-agnostic — no field names are hardcoded."""
-    merged = dict(data)
-    for key, value in args.items():
-        for field_value in data.values():
-            if not isinstance(field_value, list):
+def _find_matching_records(
+    data: dict[str, Any], args: dict[str, Any]
+) -> tuple[dict[str, Any], int]:
+    """Generic correlation for resolve_for_confirm: find the item (inside any top-level list of
+    dicts in the resolved data) whose same-named fields equal the write's string args — ids like
+    "B-9", never numbers, which match by coincidence. Returns the top-level data merged with the
+    matched item, and how many items matched (only exactly 1 is usable; 0 keeps the top level).
+    Stays domain-agnostic — no field names are hardcoded."""
+    id_args = {k: v for k, v in args.items() if isinstance(v, str)}
+    matched: list[dict[str, Any]] = []
+    for field_value in data.values():
+        if not isinstance(field_value, list):
+            continue
+        for item in field_value:
+            if not isinstance(item, dict):
                 continue
-            for item in field_value:
-                if isinstance(item, dict) and item.get(key) == value:
-                    merged.update(item)
-    return merged
+            shared = [k for k in id_args if k in item]
+            if shared and all(item[k] == id_args[k] for k in shared):
+                matched.append(item)
+    if len(matched) != 1:
+        return dict(data), len(matched)
+    return {**data, **matched[0]}, 1
+
+
+@dataclass(frozen=True)
+class ConfirmResolution:
+    """What the confirmation question is rendered from, and the args to store for execution.
+    `pinned_args` replaces each arg with the resolved record's same-named value (e.g. a
+    'latest' sentinel ref becomes the concrete id), so what executes is what the user heard."""
+
+    fields: dict[str, Any]
+    pinned_args: dict[str, Any]
+    ambiguous: bool = False  # several records matched: the confirmation can't name just one
 
 
 def render_confirm_template(template: str, fields: dict[str, Any]) -> str:
@@ -196,12 +216,16 @@ class ToolRegistry:
             )
         return result
 
+    def validate(self, name: str, args: dict[str, Any]) -> list[str]:
+        tool = self._core_tools.get(name) or self._pack_tools[name]
+        return validate_args(tool.params, args)
+
     async def resolve_confirm_fields(
         self, write_tool_name: str, args: dict[str, Any], ctx: ToolContext, handler: HostToolHandler
-    ) -> dict[str, Any]:
+    ) -> ConfirmResolution:
         pack_tool = self._pack_tools[write_tool_name]
         if not pack_tool.resolve_for_confirm:
-            return dict(args)
+            return ConfirmResolution(fields=dict(args), pinned_args=dict(args))
 
         resolve_tool = self._pack_tools[pack_tool.resolve_for_confirm]
         resolve_args = {
@@ -209,9 +233,20 @@ class ToolRegistry:
         }
         result = await self.dispatch(pack_tool.resolve_for_confirm, resolve_args, ctx, handler)
         if result.status != "ok" or not result.data:
-            return dict(args)
+            return ConfirmResolution(fields=dict(args), pinned_args=dict(args))
 
-        return {**_find_matching_records(result.data, args), **args}
+        record, matches = _find_matching_records(result.data, args)
+        # Pin only what the resolver was asked about (e.g. a 'latest' ref it resolved), so no
+        # other user-supplied value can be silently swapped for a record's field.
+        pinned = {
+            k: record[k]
+            if k in resolve_args and isinstance(record.get(k), str | int | float)
+            else v
+            for k, v in args.items()
+        }
+        return ConfirmResolution(
+            fields={**record, **pinned}, pinned_args=pinned, ambiguous=matches > 1
+        )
 
     async def _search_knowledge(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if self._embeddings is None or self._knowledge_store is None:

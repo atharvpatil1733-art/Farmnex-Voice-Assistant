@@ -8,13 +8,19 @@ from fastapi import FastAPI
 
 from voice_core.adapters.embeddings_factory import build_embeddings
 from voice_core.adapters.fakes.auth import FakeAuthVerifier
+from voice_core.adapters.fakes.conversation import FakeConversationStore
 from voice_core.adapters.fakes.llm import FakeLLM
+from voice_core.adapters.supabase.conversation import SupabaseConversationStore
 from voice_core.config import Settings, get_settings
 from voice_core.packs.loader import load_pack
 from voice_core.ports.knowledge import KnowledgeStore
 from voice_core.ports.llm import LLMProvider
+from voice_core.ports.store import ConversationStore
 from voice_core.ports.types import Principal
+from voice_core.tools.handlers.graphql import GraphQLToolHandler
+from voice_core.tools.handlers.http import HttpToolHandler
 from voice_core.tools.handlers.mock import MockToolHandler
+from voice_core.tools.handlers.router import HandlerRouter
 from voice_core.tools.registry import ToolRegistry
 from voice_core.transport.rest import router as chat_router
 
@@ -84,6 +90,25 @@ def _build_auth_verifier(settings: Settings) -> FakeAuthVerifier:
     return FakeAuthVerifier({_DEV_TOKEN: Principal(user_ref=_DEV_USER_REF)})
 
 
+def _check_host_api_transport(settings: Settings, *, uses_host_api: bool) -> None:
+    # forward_user_jwt sends the user's session JWT to the host API; never over plain http.
+    if uses_host_api and settings.app_env != "dev":
+        if not settings.host_api_base_url.startswith("https://"):
+            raise RuntimeError("HOST_API_BASE_URL must use https outside app_env=dev")
+
+
+def _build_conversation_store(settings: Settings) -> ConversationStore:
+    if settings.database_url:
+        return SupabaseConversationStore(
+            database_url=settings.database_url,
+            statement_cache_size=settings.db_statement_cache_size,
+        )
+    if settings.app_env != "dev":
+        # Pending actions and the audit trail must survive restarts outside dev.
+        raise RuntimeError("DATABASE_URL is required outside app_env=dev (confirmation gate)")
+    return FakeConversationStore()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
@@ -96,17 +121,43 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.pack = pack
     app.state.registry = ToolRegistry(pack, embeddings=embeddings, knowledge_store=knowledge_store)
-    app.state.tool_handler = MockToolHandler(pack.pack_dir)
+    _check_host_api_transport(
+        settings,
+        uses_host_api=any(t["handler"]["type"] in ("http", "graphql") for t in pack.tools),
+    )
+    http_handler = HttpToolHandler(
+        settings.host_api_base_url,
+        auth_mode=settings.host_api_auth_mode,
+        service_token=settings.host_api_service_token,
+    )
+    graphql_handler = GraphQLToolHandler(
+        settings.host_api_base_url,
+        auth_mode=settings.host_api_auth_mode,
+        service_token=settings.host_api_service_token,
+    )
+    app.state.tool_handler = HandlerRouter(
+        {
+            "mock": MockToolHandler(pack.pack_dir),
+            "http": http_handler,
+            "graphql": graphql_handler,
+        }
+    )
     app.state.llm = _build_llm(settings)
     app.state.embeddings = embeddings
     app.state.knowledge_store = knowledge_store
     app.state.auto_rag_min_sim = settings.auto_rag_min_sim
     app.state.auth_verifier = _build_auth_verifier(settings)
+    conversation_store = _build_conversation_store(settings)
+    app.state.conversation_store = conversation_store
 
     yield
 
     if knowledge_store is not None:
         await knowledge_store.close()  # type: ignore[attr-defined]
+    if isinstance(conversation_store, SupabaseConversationStore):
+        await conversation_store.close()
+    await http_handler.aclose()
+    await graphql_handler.aclose()
 
 
 app = FastAPI(title="voice-core", lifespan=lifespan)

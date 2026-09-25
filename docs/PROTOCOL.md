@@ -91,3 +91,22 @@ Error codes: `AUTH_FAILED`, `CONSENT_REQUIRED`, `PROTOCOL_ERROR`, `UTTERANCE_TOO
 - If TTS fails for a sentence, the server still sends `assistant.text.final` (captions) and an
   `error` with `TTS_FAILED`; the client shows the text.
 - Version bump rules: additive fields = same version; renamed/removed fields = `protocol_version` + 1.
+
+## REST text API (M1–M3, used before the WebSocket exists)
+
+All calls send `Authorization: Bearer <user session JWT>`.
+
+`POST /v1/chat` — `{"text", "language", "conversation_id"?, "history"?: [{"role":"user"|"assistant","content"}]}`.
+Omit `conversation_id` on the first turn; the response returns one, and later turns must send it.
+The conversation must belong to the caller (otherwise `404`). Response:
+`{"conversation_id","reply","reply_language","tools_called","pending_action","pending_action_id",
+"executed","executed_tool","confirmed_via","pending_status","prompt_hash"}`.
+When `pending_action_id` is set, `reply` is the confirmation question; show a confirm card for it.
+`pending_status` values: `pending` | `cancelled` | `expired` | `executed_ok` | `executed_error`.
+Any `cancelled`/`expired`/`executed_*` status means: drop any confirm card you are showing.
+
+`POST /v1/confirm` — the ✓/✗ buttons: `{"conversation_id","action_id","decision":"yes"|"no","language"}`.
+Only the conversation's current open action can be resolved; a stale or unknown `action_id`
+returns `executed: false` with a "nothing to confirm" reply. A voice "yes"/"no" sent as a normal
+`/v1/chat` turn resolves the same action. Pending state is server-side only — clients never send
+tool turns or arguments back (`history` accepts only user/assistant roles).

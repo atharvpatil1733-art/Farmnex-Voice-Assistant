@@ -5,13 +5,15 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from voice_core.adapters.embeddings_factory import build_embeddings
+from voice_core.adapters.fakes.conversation import FakeConversationStore
 from voice_core.adapters.fakes.llm import FakeLLM
-from voice_core.agent.loop import PendingWrite, TurnResult, run_text_turn
+from voice_core.agent.confirmation import ConfirmationGate
+from voice_core.agent.loop import TurnResult, resolve_pending_action, run_text_turn
 from voice_core.config import Settings, get_settings
 from voice_core.evals.metrics import CaseOutcome, evaluate_case, tool_selection_accuracy
 from voice_core.kb.retriever import search_knowledge
@@ -101,6 +103,14 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return cases
 
 
+class _EvalClock:
+    def __init__(self) -> None:
+        self.now = datetime.now(tz=UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
 async def run_case(
     case: dict[str, Any],
     pack: LoadedPack,
@@ -110,49 +120,77 @@ async def run_case(
     knowledge_store: KnowledgeStore | None = None,
     auto_rag_min_sim: float = 0.45,
 ) -> list[TurnResult]:
+    """Run one case against a fresh in-memory ConversationStore (evals never touch the real
+    conversation tables). Turns are {"user": text}, {"button": "yes"|"no"} for the confirm
+    card, and may carry "advance_seconds" to move the clock first (expiry cases)."""
     handler = MockToolHandler(pack.pack_dir, fixture_overrides=case.get("fixture_overrides"))
     ctx = ToolContext(user_ref="eval-user", language=case["language"])
+    store = FakeConversationStore()
+    clock = _EvalClock()
+    conversation_id = await store.create_conversation(
+        "eval-user", pack.id, "eval", case["language"]
+    )
     history: list[ChatMessage] = []
-    pending_write: PendingWrite | None = None
     language = case["language"]
     results: list[TurnResult] = []
 
     for turn in case["turns"]:
+        clock.now += timedelta(seconds=turn.get("advance_seconds", 0))
+        if "button" in turn:
+            action, _ = await ConfirmationGate(store, clock=clock).current(conversation_id)
+            if action is None or action.status != "pending":
+                # The model never proposed the write: the case fails on its checks, not here.
+                results.append(
+                    TurnResult(
+                        reply_text="",
+                        reply_language=language,
+                        tools_called=[],
+                        tool_results=[],
+                        knowledge_used=[],
+                        pending_action=None,
+                        pending_write_args=None,
+                        executed=False,
+                        executed_tool=None,
+                        confirmed_via=None,
+                        pending_status=None,
+                        prompt_hash="",
+                    )
+                )
+                continue
+            result = await resolve_pending_action(
+                registry=registry,
+                handler=handler,
+                store=store,
+                ctx=ctx,
+                action=action,
+                decision=turn["button"],
+                via="button",
+                language=language,
+                clock=clock,
+            )
+            results.append(result)
+            continue
+
         user_text = turn["user"]
         result = await run_text_turn(
             pack=pack,
             registry=registry,
             handler=handler,
             llm=llm,
+            store=store,
+            conversation_id=conversation_id,
             ctx=ctx,
             language=language,
             history=history,
             user_text=user_text,
-            pending_write=pending_write,
             embeddings=embeddings,
             knowledge_store=knowledge_store,
             auto_rag_min_sim=auto_rag_min_sim,
+            clock=clock,
         )
         results.append(result)
-
         history.append(ChatMessage(role="user", content=user_text))
         history.append(ChatMessage(role="assistant", content=result.reply_text))
-        if result.pending_action is not None:
-            marker = json.dumps(
-                {"status": "awaiting_confirmation", "args": result.pending_write_args}
-            )
-            history.append(
-                ChatMessage(
-                    role="tool",
-                    content=f'<tool_result tool="{result.pending_action}">{marker}</tool_result>',
-                )
-            )
-            pending_write = PendingWrite(
-                tool=result.pending_action, args=result.pending_write_args or {}
-            )
-        else:
-            pending_write = None
-
         language = result.reply_language
 
     return results

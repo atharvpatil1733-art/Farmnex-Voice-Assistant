@@ -42,7 +42,13 @@ class RenderedPrompt:
 
 
 def wrap_tool_result(tool_name: str, trimmed_data: dict[str, Any] | None) -> ChatMessage:
-    payload = json.dumps(trimmed_data or {}, ensure_ascii=False)
+    # Escape angle brackets (still valid JSON) so host data can't close the tag early and
+    # smuggle text outside the untrusted-data wrapper.
+    payload = (
+        json.dumps(trimmed_data or {}, ensure_ascii=False)
+        .replace("<", r"\u003c")
+        .replace(">", r"\u003e")
+    )
     return ChatMessage(
         role="tool",
         content=f'<tool_result tool="{tool_name}">{payload}</tool_result>',

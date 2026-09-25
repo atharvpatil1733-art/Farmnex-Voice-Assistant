@@ -17,3 +17,16 @@ def test_non_dev_env_refuses_to_start_without_a_real_verifier() -> None:
     settings = Settings(app_env="prod")
     with pytest.raises(RuntimeError, match="no real AuthVerifier"):
         _build_auth_verifier(settings)
+
+
+def test_host_api_must_be_https_outside_dev_when_tools_call_it() -> None:
+    from app.main import _check_host_api_transport
+
+    prod_http = Settings(app_env="prod", host_api_base_url="http://host.example")
+    with pytest.raises(RuntimeError, match="https"):
+        _check_host_api_transport(prod_http, uses_host_api=True)
+    _check_host_api_transport(prod_http, uses_host_api=False)  # all-mock pack: fine
+    _check_host_api_transport(
+        Settings(app_env="prod", host_api_base_url="https://host.example"), uses_host_api=True
+    )
+    _check_host_api_transport(Settings(app_env="dev"), uses_host_api=True)

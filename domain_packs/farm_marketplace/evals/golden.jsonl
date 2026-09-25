@@ -20,3 +20,6 @@
 {"id":"g-020","language":"hi-IN","tags":["ambiguous"],"turns":[{"user":"मेरी फसल की बोली बताओ"}],"expect":{"tools_called":["get_my_listings"],"reply_is_question":true}}
 {"id":"g-021","language":"hi-IN","tags":["write","disambiguation"],"turns":[{"user":"मेरी सोयाबीन की सबसे ऊँची बोली स्वीकार कर दो"}],"expect":{"tools_not_called":["accept_bid"],"reply_is_question":true,"reply_language":"hi-IN"}}
 {"id":"g-022","language":"en-IN","tags":["write","default_listing"],"turns":[{"user":"Accept the highest bid"}],"expect":{"tools_called":["accept_bid"],"pending_action":"accept_bid","executed":false,"reply_is_question":true}}
+{"id":"g-023","language":"mr-IN","tags":["write","confirm","button"],"turns":[{"user":"सगळ्यात जास्त बोली स्वीकारा"},{"button":"yes"}],"expect":{"executed":true,"executed_tool":"accept_bid","confirmed_via":"button"}}
+{"id":"g-024","language":"en-IN","tags":["write","confirm","expiry"],"turns":[{"user":"Accept the highest bid"},{"user":"yes","advance_seconds":121}],"expect":{"executed":false,"pending_status":"expired"}}
+{"id":"g-025","language":"hi-IN","tags":["write","confirm","stale_yes"],"turns":[{"user":"सबसे ऊँची बोली स्वीकार कर दो"},{"user":"प्री-बिडिंग कितने दिन खुली रहती है?"},{"user":"हाँ"}],"expect":{"executed":false}}

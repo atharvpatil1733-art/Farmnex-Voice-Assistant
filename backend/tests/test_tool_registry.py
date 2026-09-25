@@ -103,12 +103,38 @@ async def test_dispatch_get_my_listings_returns_nested_listings(
 async def test_resolve_confirm_fields_merges_matching_record(
     registry: ToolRegistry, handler: MockToolHandler, ctx: ToolContext
 ) -> None:
-    fields = await registry.resolve_confirm_fields(
+    resolution = await registry.resolve_confirm_fields(
         "accept_bid", {"listing_ref": "L-102", "bid_ref": "B-9"}, ctx, handler
     )
-    assert fields["price_per_kg"] == 27
-    assert fields["crop"] == "onion"
-    assert fields["quantity_kg"] == 500
+    assert resolution.fields["price_per_kg"] == 27
+    assert resolution.fields["crop"] == "onion"
+    assert resolution.fields["quantity_kg"] == 500
+    assert resolution.pinned_args == {"listing_ref": "L-102", "bid_ref": "B-9"}
+
+
+async def test_resolve_confirm_fields_pins_sentinel_args_to_the_resolved_record(
+    registry: ToolRegistry, handler: MockToolHandler, ctx: ToolContext
+) -> None:
+    """'latest' must be stored as the concrete listing the user heard confirmed, so the host
+    can't resolve it to a different listing at execution time."""
+    resolution = await registry.resolve_confirm_fields(
+        "accept_bid", {"listing_ref": "latest", "bid_ref": "B-9"}, ctx, handler
+    )
+    assert resolution.pinned_args == {"listing_ref": "L-102", "bid_ref": "B-9"}
+    assert resolution.fields["listing_ref"] == "L-102"
+
+
+async def test_resolve_confirm_fields_without_resolver_keeps_args(
+    registry: ToolRegistry, handler: MockToolHandler, ctx: ToolContext
+) -> None:
+    args = {"crop": "tomato", "quantity_kg": 500, "harvest_date": "2026-10-05"}
+    resolution = await registry.resolve_confirm_fields("create_prebid_listing", args, ctx, handler)
+    assert resolution.pinned_args == args
+
+
+def test_validate_reports_schema_errors(registry: ToolRegistry) -> None:
+    assert registry.validate("accept_bid", {"listing_ref": "L-102", "bid_ref": "B-9"}) == []
+    assert registry.validate("accept_bid", {"listing_ref": "L-102"})
 
 
 def test_is_write_distinguishes_read_and_write_tools(registry: ToolRegistry) -> None:
@@ -166,3 +192,37 @@ async def test_search_knowledge_tool_returns_error_result_on_store_failure(
 
     assert result.status == "error"
     assert result.error_code == "KNOWLEDGE_STORE_UNAVAILABLE"
+
+
+def test_correlation_uses_only_string_ids_not_coincidental_numbers() -> None:
+    """Review repro: a numeric arg equal to some unrelated item's field used to merge that
+    item in, so the confirmation named a different record than the one stored."""
+    from voice_core.tools.registry import _find_matching_records
+
+    data = {
+        "ref": "L1",
+        "name": "first",
+        "items": [{"item_ref": "B1", "price": 27}, {"count": 3, "name": "other"}],
+    }
+    record, matches = _find_matching_records(data, {"item_ref": "B1", "count": 3})
+    assert matches == 1
+    assert record["name"] == "first"
+    assert record["price"] == 27
+
+
+def test_correlation_reports_ambiguity() -> None:
+    from voice_core.tools.registry import _find_matching_records
+
+    data = {"items": [{"item_ref": "B1", "v": 1}, {"item_ref": "B1", "v": 2}]}
+    _, matches = _find_matching_records(data, {"item_ref": "B1"})
+    assert matches == 2
+
+
+async def test_only_args_sent_to_the_resolver_are_pinned(
+    registry: ToolRegistry, handler: MockToolHandler, ctx: ToolContext
+) -> None:
+    resolution = await registry.resolve_confirm_fields(
+        "accept_bid", {"listing_ref": "latest", "bid_ref": "B-9"}, ctx, handler
+    )
+    assert resolution.pinned_args == {"listing_ref": "L-102", "bid_ref": "B-9"}
+    assert resolution.ambiguous is False

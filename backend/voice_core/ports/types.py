@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 AudioFormat = Literal["pcm_s16le_16k", "wav_22050"]
@@ -124,6 +125,10 @@ class ToolDef:
 class ToolContext:
     user_ref: str
     language: str
+    # Set only when executing a confirmed write; http/graphql handlers send it to the host.
+    idempotency_key: str | None = None
+    # The caller's own session JWT, for handlers in `forward_user_jwt` mode. Never logged.
+    auth_token: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -133,3 +138,43 @@ class ToolResult:
     error_code: str | None = None
     user_message_key: str | None = None
     client_actions: tuple[dict[str, Any], ...] = ()
+
+
+PendingStatus = Literal[
+    "pending", "executing", "executed_ok", "executed_error", "cancelled", "expired"
+]
+OPEN_PENDING_STATUSES: tuple[PendingStatus, ...] = ("pending", "executing")
+
+
+@dataclass(frozen=True)
+class PendingAction:
+    """A proposed write awaiting the user's explicit yes (SPEC §7). Stored server-side;
+    execution always uses these stored `args`, never anything re-supplied by a client."""
+
+    id: str
+    conversation_id: str
+    user_ref: str
+    tool_name: str
+    args: dict[str, Any]
+    summary: str
+    language: str
+    status: PendingStatus
+    idempotency_key: str
+    expires_at: datetime
+    confirmed_via: Literal["voice", "button"] | None = None
+
+
+@dataclass(frozen=True)
+class ToolInvocation:
+    """One audit row in voice.tool_invocations."""
+
+    user_ref: str
+    tool_name: str
+    kind: Literal["read", "write"]
+    args: dict[str, Any]
+    status: Literal["ok", "error", "not_found", "forbidden", "invalid", "timeout"]
+    conversation_id: str | None = None
+    pending_action_id: str | None = None
+    turn_id: str | None = None
+    error_code: str | None = None
+    duration_ms: int | None = None
