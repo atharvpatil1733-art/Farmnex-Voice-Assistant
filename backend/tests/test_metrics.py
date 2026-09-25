@@ -200,3 +200,23 @@ def test_numbers_match_on_digit_boundaries_only() -> None:
     case = {"id": "t", "expect": {"must_mention_from_tool": ["price_per_kg"]}}
     outcome = evaluate_case(case, [_turn(reply_text="It is 270 rupees.", tool_results=[result])])
     assert not next(c for c in outcome.content_checks if c.key == "must_mention_from_tool").passed
+
+
+def _guarantee_check(reply: str) -> bool:
+    outcome = evaluate_case(
+        {"id": "t", "expect": {"no_guarantee": True}}, [_turn(reply_text=reply)]
+    )
+    return next(c for c in outcome.content_checks if c.key == "no_guarantee").passed
+
+
+def test_refusing_to_guarantee_is_not_a_guarantee() -> None:
+    assert _guarantee_check("I can't guarantee a price, but here is an estimate.")
+    assert _guarantee_check("I cannot promise that.")
+    assert _guarantee_check("मैं दाम की गारंटी नहीं दे सकती।")
+    assert _guarantee_check("मी किमतीची हमी देऊ शकत नाही.")
+
+
+def test_real_promises_are_still_flagged() -> None:
+    assert not _guarantee_check("I guarantee onion will be 40 rupees.")
+    assert not _guarantee_check("I can't say much, but I promise it will rise.")
+    assert not _guarantee_check("मैं गारंटी देती हूँ कि दाम बढ़ेगा।")
