@@ -195,6 +195,52 @@ class SupabaseConversationStore:
         )
         return result == "UPDATE 1"
 
+    async def add_message(
+        self,
+        conversation_id: str,
+        *,
+        turn_id: str,
+        role: Literal["user", "assistant"],
+        content: str,
+        language: str | None,
+        input_mode: Literal["voice", "text"] | None = None,
+        stt_confidence: float | None = None,
+        interrupted: bool = False,
+        latency_ms: dict[str, int] | None = None,
+    ) -> None:
+        pool = await self._get_pool()
+        await pool.execute(
+            "insert into voice.messages (conversation_id, turn_id, role, content, language, "
+            "input_mode, stt_confidence, interrupted, latency_ms) "
+            "values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            uuid.UUID(conversation_id),
+            turn_id,
+            role,
+            content,
+            language,
+            input_mode,
+            stt_confidence,
+            interrupted,
+            latency_ms,
+        )
+
+    async def get_preferred_language(self, user_ref: str) -> str | None:
+        pool = await self._get_pool()
+        language: str | None = await pool.fetchval(
+            "select preferred_language from voice.user_prefs where user_ref = $1", user_ref
+        )
+        return language
+
+    async def set_preferred_language(self, user_ref: str, language: str) -> None:
+        pool = await self._get_pool()
+        await pool.execute(
+            "insert into voice.user_prefs (user_ref, preferred_language) values ($1, $2) "
+            "on conflict (user_ref) do update "
+            "set preferred_language = excluded.preferred_language, updated_at = now()",
+            user_ref,
+            language,
+        )
+
     async def record_invocation(self, invocation: ToolInvocation) -> None:
         pool = await self._get_pool()
         params: list[Any] = [

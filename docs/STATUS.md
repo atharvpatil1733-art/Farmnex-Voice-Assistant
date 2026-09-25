@@ -3,11 +3,13 @@
 Update after every milestone. Keep it short and factual.
 
 ## Current milestone
-M1 gate PASSED and M2 gate PASSED 2026-09-25 (see Measured numbers).
-**M3 gate PASSED 2026-09-25: 13/13 write-flow eval cases pass — every write pauses for
-confirmation; "no", timeout (g-024) and a stale "yes" after a topic change (g-025) never
-execute.** Red-team suite: 9/9 structural PASS (see Measured numbers). Pack tools stay on `mock` by user decision (no host API exists yet); the http/graphql
-handlers are built and unit-tested against mocked HTTP only.
+M1, M2, M3 gates PASSED (2026-09-25, see Measured numbers).
+**M4 (push-to-talk voice) code-complete 2026-09-25; latency gate NOT yet measured** — it needs
+`SARVAM_API_KEY` in `backend/.env` (plus `STT_PROVIDER=sarvam`, `TTS_PROVIDER=sarvam`, already
+set). Then: `uv run uvicorn app.main:app --port 8000` and
+`uv run python -m voice_core.evals.latency --synthesize`. Also still open: choosing the female
+voice (`uv run python -m voice_core.evals.audition`, listen, set `voice.tts_speaker` in
+pack.yaml); until then the placeholder speaker `priya` is used with a startup warning.
 
 ## What works
 - Repo layout under `backend/` per CLAUDE.md: `app/`, `voice_core/{ports,adapters,agent,tools,kb,
@@ -29,6 +31,65 @@ handlers are built and unit-tested against mocked HTTP only.
 - `search_knowledge` is now wired to a real `KnowledgeStore`/`EmbeddingProvider` when both are
   configured (M2); falls back to `{"chunks": []}` when either is `None` (e.g. `DATABASE_URL`
   unset), so M1-only setups keep working unchanged.
+
+## What works (M4)
+- **WebSocket `/v1/voice`** (`transport/ws.py`) implementing docs/PROTOCOL.md v1 push-to-talk:
+  session.start auth (5 s timeout → 4400, bad token → 4401, auth.refresh can't switch users),
+  audio buffering capped at `MAX_UTTERANCE_SECONDS` (→ `UTTERANCE_TOO_LONG`, STT not called),
+  one turn task at a time (new audio/text implies interrupt), STT → `transcript.final` →
+  agent turn → `assistant.text.final` (captions keep symbols) → sentence split → normalize →
+  TTS (2 concurrent) → strictly ordered `audio.segment` header + binary under one send lock.
+  `confirm.request` / `confirm.response` / `action.result` wired to the M3 gate
+  (`confirmed_via=button`); unknown action → `expired`. `tool.activity` with the pack's
+  `display_hint`, and the pack filler spoken once if a tool runs > 1.2 s. Interrupt cancels the
+  turn (writes stay shielded), `turn.end.interrupted=true`, and the heard part is stored with
+  `interrupted=true`. Localized errors: `STT_EMPTY`, `STT_FAILED`, `TTS_FAILED` (captions still
+  sent), `INTERNAL`, `PROTOCOL_ERROR` (bad frame doesn't drop the session).
+- **Design choice (golden rule 5):** a reply is spoken only after the LLM finished it, never
+  mid-generation, so text preceding a write-tool call can't be heard as a result. TTS still
+  starts on the first sentence while later ones synthesize. Revisit only if the latency gate
+  shows the LLM stage is the bottleneck.
+- `transport/protocol.py` pydantic models; `tests/test_protocol_contract.py` parses every JSON
+  example in PROTOCOL.md (31 cases) so doc and code can't drift.
+- **Sarvam adapters** (`adapters/sarvam/`, verified against docs.sarvam.ai 2026-09-25):
+  `saaras:v3` `mode=transcribe`, `language_code=unknown` (auto-detect; `language_probability`
+  feeds language switching), PCM wrapped as WAV, clips < 300 ms skipped; `bulbul:v3` with
+  speaker/pace/22050 Hz, base64 WAV decoded. Retries (2, jittered) only on 429/503/timeouts;
+  errors never include the key. Live round-trip test (TTS → STT, hi/mr/en) ready, skipped
+  until the key exists.
+- **Speech text** (`speech/`): sentence segmenter (no splits in `25.5`, `10.30`, `Rs.`,
+  `Dr.`; force-flush at 180 chars); per-language normalizer (hi/mr/en tables in
+  `speech/locale/`): ₹/Rs/`/-` → spoken currency, ISO dates → "18 सितंबर"/"आज"/"उद्या",
+  ISO datetimes and HH:MM → "शाम छह बजे"/"सकाळी साडेदहा वाजता"/"6 in the evening", %,
+  &, markdown/emoji/URLs/bracketed ids removed, bullets → sentences. Units are **pack data**
+  (`pack.yaml → speech_units`) — the boundary test caught kg/quintal in core, correctly.
+- **Language switching** (`agent/language.py`, SPEC §9): auto-switch only after 2 consecutive
+  turns of ≥ 3 words at confidence ≥ 0.8; code-mixed Devanagari never counts as English;
+  explicit switches (tool call or `language.set`) persist to `voice.user_prefs`, and the next
+  session starts in the saved language.
+- Store: `add_message` (transcripts + `latency_ms`, never audio) and preferred language;
+  live contract 10/10 on the real schema.
+- Latency: `observability/timing.py` → `turn.end.latency_ms` and `voice.messages.latency_ms`
+  (`stt`, `llm`, `tts_first_audio`, `first_audio_total`, `turn_total`).
+- Tools: `voice_core.evals.latency` (M4 gate over the real socket; 4G model = +RTT 120 ms +
+  first segment at 2 Mbps; proven end-to-end against fakes in a test) and
+  `voice_core.evals.audition` (samples of 14 candidate female voices × 3 languages). Their
+  sentences live in the pack (`evals/voice_samples.yaml`).
+- **voice-safety-reviewer fixes (2026-09-25, no blockers found):** a turn that may execute a
+  confirmed write is *protected* — interrupts mute its audio but never cancel it, so the real
+  `action.result` is always sent (was: double tap/interrupt reported "expired" for a write that
+  succeeded); duplicate taps on the same card are ignored; every new turn first ends the
+  previous one (was: `audio.start → text.input → audio.end` ran two turns); token `exp`
+  re-checked before each turn (4401); a proposal interrupted before its question was sent is
+  cancelled; filler audio is never `is_last` and the reply always ends with exactly one
+  `is_last` (empty terminal segment if the last TTS failed); replaced cards get
+  `action.result: cancelled`; binary frames > 64 KB close 4400 — **run uvicorn with
+  `--ws-max-size 65536`** in deployment; normalizer now strips every Unicode symbol, any URL
+  scheme, bare domains and emails, and speaks bare unit aliases (property-tested in 3 languages);
+  outside dev a TTS voice must be chosen.
+- Dev without a Sarvam key: server starts and `/v1/voice` uses fake STT/TTS with a warning;
+  outside `app_env=dev` a missing key is a startup error.
+- Tests: 355 unit tests; mypy --strict clean on all M4 modules; bandit 0 issues.
 
 ## What works (M3)
 - **Server-side confirmation gate** replaces the M1 client-echoed `pending_write` stub (which a
@@ -145,6 +206,14 @@ handlers are built and unit-tested against mocked HTTP only.
 | 2026-09-22 | Follow-up fixes from `voice-safety-reviewer` on the fallback-chain diff: (1) `FallbackLLM`'s defensive `for...else` branch (a sub-provider stream ending without `Done`/`LLMError`) now synthesizes an `LLMError` instead of silently returning nothing, so the "every stream ends in Done or LLMError" contract holds even for a hypothetical buggy future adapter; (2) `_build_chain_provider` (in both `app/main.py` and `evals/run.py`) now raises `ValueError` immediately if a chain entry is missing a model (e.g. a bare `gemini` with no `:model`), instead of silently constructing a provider with an empty model string that would only fail at call time; (3) removed the `gemini_api_key or llm_api_key` cross-vendor fallback — `GEMINI_API_KEY` must now be set explicitly for chain mode, since the old fallback could silently send an unrelated vendor's key (from `LLM_API_KEY`, e.g. an Anthropic/OpenAI-compat key from single-provider mode) to Google's endpoint with no warning | Reviewer flagged the cross-vendor key fallback as a real credential-leak footgun (not logged, not committed, but a real risk if a user has `LLM_API_KEY` set for something else and forgets `GEMINI_API_KEY`); the other two were correctness/robustness gaps in freshly-added code, not exploitable today but worth closing before this becomes load-bearing | New `backend/tests/test_llm_wiring.py`: missing-model raises, unknown-provider raises, and a regression test (`test_gemini_branch_never_falls_back_to_generic_llm_api_key`) that monkeypatches `GeminiLLM` to capture the `api_key` it's constructed with and asserts it's never the unrelated `llm_api_key` value |
 
 ## Known issues
+- **M4 not done until measured:** latency gate (median first audio ≤ 2.5 s, 4G-like) and the
+  Android-phone check are unmeasured — no `SARVAM_API_KEY` yet. The 4G figure is a model
+  (loopback + RTT + first-segment download), not a real mobile network.
+- M4 review leftovers (M7): no per-session/per-user rate limit or concurrent-socket cap, no
+  overall turn deadline (adapters have their own timeouts), no idle/ping enforcement.
+- Deferred to M5 (need the app): real Supabase JWT verifier (WS still uses the dev-token
+  fake, dev only), voice-processing consent (`CONSENT_REQUIRED` / 4403), client actions.
+  Deferred to M7: rate limits (4429), per-user concurrent-session cap.
 - **M3 leftovers (from voice-safety-reviewer 2026-09-25, not blockers):** the
   `resolve_for_confirm` read is not audited (it bypasses the audited dispatch); an audit-row
   insert failure after a successful write is only logged; http/graphql responses have no size

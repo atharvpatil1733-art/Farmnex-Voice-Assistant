@@ -31,6 +31,7 @@ async def test_supabase_store_contract(
         pool = await store._get_pool()
         await pool.execute(
             "delete from voice.tool_invocations where user_ref = 'u-contract'; "
+            "delete from voice.user_prefs where user_ref like 'u-contract-%'; "
             "delete from voice.conversations where pack_id = 'contract_pack'"
         )
         await store.close()

@@ -111,7 +111,39 @@ async def check_executing_action_blocks_a_new_proposal(store: ConversationStore)
     assert second.status == "executing"
 
 
+async def check_messages_are_recorded(store: ConversationStore) -> None:
+    conversation_id = await _conversation(store)
+    await store.add_message(
+        conversation_id,
+        turn_id="t-1",
+        role="user",
+        content="hello",
+        language="en-IN",
+        input_mode="voice",
+        stt_confidence=0.9,
+    )
+    await store.add_message(
+        conversation_id,
+        turn_id="t-1",
+        role="assistant",
+        content="hi there",
+        language="en-IN",
+        interrupted=True,
+        latency_ms={"stt": 400, "first_audio_total": 1800},
+    )
+
+
+async def check_preferred_language_round_trip(store: ConversationStore) -> None:
+    user_ref = f"u-contract-{uuid.uuid4()}"
+    assert await store.get_preferred_language(user_ref) is None
+    await store.set_preferred_language(user_ref, "mr-IN")
+    await store.set_preferred_language(user_ref, "en-IN")
+    assert await store.get_preferred_language(user_ref) == "en-IN"
+
+
 ALL_CHECKS = [
+    check_messages_are_recorded,
+    check_preferred_language_round_trip,
     check_executing_action_blocks_a_new_proposal,
     check_owner_is_recorded,
     check_upsert_then_get_open,

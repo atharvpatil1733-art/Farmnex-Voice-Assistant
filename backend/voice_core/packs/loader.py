@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from voice_core.speech.units import SpokenUnit, parse_units
+
 
 class PackLoadError(Exception):
     def __init__(self, pack_id: str, path: Path | str, reason: str) -> None:
@@ -29,6 +31,9 @@ class LoadedPack:
     confirmation_lexicon_extra: dict[str, list[str]]
     client_actions: tuple[str, ...]
     pack_dir: Path
+    speech_units: tuple[SpokenUnit, ...] = ()
+    tts_speaker: str | None = None
+    speech_pace: float = 1.0
 
 
 def _load_yaml(pack_id: str, path: Path) -> Any:
@@ -81,6 +86,15 @@ def load_pack(pack_id: str, packs_root: Path) -> LoadedPack:
                 raise PackLoadError(pack_id, wf_file, "workflow file must be a mapping")
             workflows.append(wf)
 
+    try:
+        speech_units = parse_units(config.get("speech_units") or [])
+    except ValueError as exc:
+        raise PackLoadError(pack_id, pack_yaml_path, str(exc)) from exc
+    voice = config.get("voice") or {}
+    speaker = voice.get("tts_speaker")
+    # A placeholder like "<audition … and set one>" means "not chosen yet".
+    tts_speaker = speaker if isinstance(speaker, str) and speaker and "<" not in speaker else None
+
     return LoadedPack(
         id=pack_id,
         languages=languages,
@@ -96,4 +110,7 @@ def load_pack(pack_id: str, packs_root: Path) -> LoadedPack:
         },
         client_actions=tuple(config.get("client_actions") or ()),
         pack_dir=pack_dir,
+        speech_units=speech_units,
+        tts_speaker=tts_speaker,
+        speech_pace=float(voice.get("speech_pace", 1.0)),
     )

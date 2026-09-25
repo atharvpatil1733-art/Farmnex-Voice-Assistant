@@ -9,3 +9,6 @@ __pycache__/
 flutter_*/build/
 flutter_*/.dart_tool/
 supabase/.temp/
+**/evals/latency_clips/
+**/evals/audition/
+*.wav

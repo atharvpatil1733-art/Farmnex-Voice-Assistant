@@ -57,5 +57,39 @@ NOTHING_TO_CONFIRM = {
 }
 
 
+STT_EMPTY = {
+    "hi-IN": "माफ़ कीजिए, मैं सुन नहीं पाई। फिर से बोलिए।",
+    "mr-IN": "माफ करा, मला ऐकू आले नाही. पुन्हा बोला.",
+    "en-IN": "Sorry, I didn't catch that. Please say it again.",
+}
+
+STT_FAILED = {
+    "hi-IN": "माफ़ कीजिए, अभी आवाज़ समझ नहीं पा रही। थोड़ी देर बाद फिर कोशिश करें।",
+    "mr-IN": "माफ करा, आत्ता आवाज समजू शकत नाही. थोड्या वेळाने पुन्हा प्रयत्न करा.",
+    "en-IN": "Sorry, I can't understand audio right now. Please try again shortly.",
+}
+
+TTS_FAILED = {
+    "hi-IN": "आवाज़ में दिक्कत है, कृपया स्क्रीन पर जवाब पढ़ें।",
+    "mr-IN": "आवाजात अडचण आहे, कृपया उत्तर स्क्रीनवर वाचा.",
+    "en-IN": "There is a problem with the voice, please read the answer on screen.",
+}
+
+UTTERANCE_TOO_LONG = {
+    "hi-IN": "यह बहुत लंबा था। कृपया थोड़ा छोटा करके बोलिए।",
+    "mr-IN": "हे खूप लांब होते. कृपया थोडक्यात बोला.",
+    "en-IN": "That was too long. Please say it more briefly.",
+}
+
+INTERNAL_ERROR = {
+    "hi-IN": "माफ़ कीजिए, कुछ गड़बड़ हो गई। कृपया फिर से कोशिश करें।",
+    "mr-IN": "माफ करा, काहीतरी चूक झाली. कृपया पुन्हा प्रयत्न करा.",
+    "en-IN": "Sorry, something went wrong. Please try again.",
+}
+
+CONFIRM_LABEL_YES = {"hi-IN": "हाँ", "mr-IN": "हो", "en-IN": "Yes"}
+CONFIRM_LABEL_NO = {"hi-IN": "नहीं", "mr-IN": "नको", "en-IN": "No"}
+
+
 def get(strings: dict[str, str], language: str, default_language: str = "en-IN") -> str:
     return strings.get(language, strings[default_language])

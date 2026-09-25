@@ -1,0 +1,18 @@
+# Sentences used by the voice tooling (core reads them; they stay here because they're domain text).
+
+# voice_core.evals.audition: real app sentences with numbers and a question, so pronunciation
+# problems are audible when choosing the assistant's voice.
+audition:
+  hi-IN: "आपके 500 किलो प्याज़ पर सबसे ऊँची बोली 27 रुपये किलो है। क्या मैं यह बोली स्वीकार करूँ?"
+  mr-IN: "तुमच्या 500 किलो कांद्याला सर्वात जास्त बोली 27 रुपये किलो आहे. ही बोली स्वीकारू का?"
+  en-IN: "The highest bid on your 500 kilos of onion is 27 rupees per kilo. Shall I accept it?"
+
+# voice_core.evals.latency --synthesize: read-only questions (no writes), spoken slowly and
+# padded to 5 s, for the M4 time-to-first-audio gate.
+latency:
+  - {language: hi-IN, text: "मेरी प्याज़ पर कितनी बोली आई है, सबसे ऊँची बोली बताइए"}
+  - {language: hi-IN, text: "मेरा माल कब उठेगा, गाड़ी किस दिन आएगी"}
+  - {language: mr-IN, text: "माझ्या कांद्याला सगळ्यात जास्त बोली किती आली आहे"}
+  - {language: mr-IN, text: "गाडी माल न्यायला कधी येणार आहे ते सांगा"}
+  - {language: en-IN, text: "When will I get paid for my soybean order"}
+  - {language: en-IN, text: "What is the highest bid on my onions right now"}

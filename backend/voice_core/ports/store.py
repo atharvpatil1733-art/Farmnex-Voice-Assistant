@@ -49,3 +49,23 @@ class ConversationStore(Protocol):
         ...
 
     async def record_invocation(self, invocation: ToolInvocation) -> None: ...
+
+    async def add_message(
+        self,
+        conversation_id: str,
+        *,
+        turn_id: str,
+        role: Literal["user", "assistant"],
+        content: str,
+        language: str | None,
+        input_mode: Literal["voice", "text"] | None = None,
+        stt_confidence: float | None = None,
+        interrupted: bool = False,
+        latency_ms: dict[str, int] | None = None,
+    ) -> None:
+        """Transcript row in voice.messages. Never raw audio (SPEC §16)."""
+        ...
+
+    async def get_preferred_language(self, user_ref: str) -> str | None: ...
+
+    async def set_preferred_language(self, user_ref: str, language: str) -> None: ...

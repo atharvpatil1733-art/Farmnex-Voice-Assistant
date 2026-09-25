@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import replace
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from voice_core.ports.types import (
     OPEN_PENDING_STATUSES,
@@ -22,6 +22,8 @@ class FakeConversationStore:
         self.conversations: dict[str, str] = {}
         self.actions: dict[str, PendingAction] = {}
         self.invocations: list[ToolInvocation] = []
+        self.messages: list[dict[str, Any]] = []
+        self.preferred_languages: dict[str, str] = {}
 
     async def create_conversation(
         self,
@@ -103,3 +105,36 @@ class FakeConversationStore:
 
     async def record_invocation(self, invocation: ToolInvocation) -> None:
         self.invocations.append(invocation)
+
+    async def add_message(
+        self,
+        conversation_id: str,
+        *,
+        turn_id: str,
+        role: Literal["user", "assistant"],
+        content: str,
+        language: str | None,
+        input_mode: Literal["voice", "text"] | None = None,
+        stt_confidence: float | None = None,
+        interrupted: bool = False,
+        latency_ms: dict[str, int] | None = None,
+    ) -> None:
+        self.messages.append(
+            {
+                "conversation_id": conversation_id,
+                "turn_id": turn_id,
+                "role": role,
+                "content": content,
+                "language": language,
+                "input_mode": input_mode,
+                "stt_confidence": stt_confidence,
+                "interrupted": interrupted,
+                "latency_ms": latency_ms,
+            }
+        )
+
+    async def get_preferred_language(self, user_ref: str) -> str | None:
+        return self.preferred_languages.get(user_ref)
+
+    async def set_preferred_language(self, user_ref: str, language: str) -> None:
+        self.preferred_languages[user_ref] = language

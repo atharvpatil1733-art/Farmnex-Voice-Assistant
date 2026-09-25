@@ -6,7 +6,7 @@ import logging
 import re
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -104,6 +104,8 @@ def _match_lexicon(text: str, extra: dict[str, list[str]]) -> Literal["yes", "no
 
 
 PendingOutcome = Literal["pending", "cancelled", "expired", "executed_ok", "executed_error"]
+# Called around each read-tool call, e.g. to show "checking…" or play a filler (SPEC §6 step 5).
+ToolActivityHook = Callable[[str, Literal["started", "finished"]], Awaitable[None]]
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +306,7 @@ async def run_text_turn(
     llm_max_tokens: int = 800,
     llm_timeout_s: float = 20.0,
     clock: Callable[[], datetime] | None = None,
+    on_tool: ToolActivityHook | None = None,
 ) -> TurnResult:
     gate = ConfirmationGate(store, clock=clock) if clock else ConfirmationGate(store)
     pending, just_expired = await gate.current(conversation_id)
@@ -352,6 +355,7 @@ async def run_text_turn(
         llm_temperature=llm_temperature,
         llm_max_tokens=llm_max_tokens,
         llm_timeout_s=llm_timeout_s,
+        on_tool=on_tool,
     )
 
     # A pending action survives only while its confirmation question is the last thing the
@@ -382,6 +386,7 @@ async def _run_llm_rounds(
     llm_temperature: float,
     llm_max_tokens: int,
     llm_timeout_s: float,
+    on_tool: ToolActivityHook | None = None,
 ) -> TurnResult:
     knowledge_chunks: list[Chunk] = []
     if embeddings is not None and knowledge_store is not None:
@@ -483,15 +488,21 @@ async def _run_llm_rounds(
                 args: dict[str, Any] = {}
             else:
                 args = parsed
-                result = await _dispatch_audited(
-                    registry=registry,
-                    handler=handler,
-                    store=store,
-                    ctx=ctx,
-                    conversation_id=conversation_id,
-                    name=call.name,
-                    args=args,
-                )
+                if on_tool is not None:
+                    await on_tool(call.name, "started")
+                try:
+                    result = await _dispatch_audited(
+                        registry=registry,
+                        handler=handler,
+                        store=store,
+                        ctx=ctx,
+                        conversation_id=conversation_id,
+                        name=call.name,
+                        args=args,
+                    )
+                finally:
+                    if on_tool is not None:
+                        await on_tool(call.name, "finished")
             tool_results.append({"tool": call.name, "data": result.data, "args": args})
 
             if call.name == "set_preferred_language" and result.status == "ok":

@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     stt_mode: str = "transcribe"
     tts_provider: Literal["sarvam", "fake"] = "fake"
     tts_model: str = "bulbul:v3"
+    tts_speaker: str = ""  # overrides pack.yaml voice.tts_speaker when set
     sarvam_api_key: str = ""
 
     # Embeddings

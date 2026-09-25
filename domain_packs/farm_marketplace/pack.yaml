@@ -41,3 +41,17 @@ evals:
   golden: evals/golden.jsonl
   retrieval: evals/retrieval.jsonl
   redteam: evals/redteam.jsonl
+
+speech_units:                  # how the voice reads units (core normalizer applies these)
+  - aliases: [kg, kgs, kilo, kilos]
+    hi-IN: किलो
+    mr-IN: किलो
+    en-IN: [kilo, kilos]
+  - aliases: [qtl, qtls, quintal, quintals]
+    hi-IN: क्विंटल
+    mr-IN: क्विंटल
+    en-IN: [quintal, quintals]
+  - aliases: [ton, tons, tonne, tonnes]
+    hi-IN: टन
+    mr-IN: टन
+    en-IN: [tonne, tonnes]
