@@ -186,3 +186,61 @@ async def test_bad_request_yields_llm_error_without_retry() -> None:
     assert isinstance(events[0], LLMError)
     assert events[0].code == "bad_request"
     assert events[0].retryable is False
+
+
+def test_default_http_client_never_uses_truststore(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: httpx2 defaults to `truststore`, whose Windows backend verifies certificate
+    chains *synchronously on the event loop* (py-spy showed the server frozen for minutes in
+    truststore._windows._get_and_verify_cert_chain). The adapter must pass a plain OpenSSL
+    context built from certifi instead."""
+    import ssl
+
+    import truststore
+
+    from voice_core.adapters.openai_compat import llm as module
+
+    context = module.certifi_ssl_context()
+    assert isinstance(context, ssl.SSLContext)
+    assert not isinstance(context, truststore.SSLContext)
+
+    captured: dict[str, object] = {}
+
+    class Recorder:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(module.httpx2, "AsyncClient", Recorder)
+    monkeypatch.setattr(module, "AsyncOpenAI", lambda **kwargs: kwargs)
+    module.OpenAICompatLLM(api_key="k", model="m", base_url="https://x")
+    assert isinstance(captured["verify"], ssl.SSLContext)
+    assert not isinstance(captured["verify"], truststore.SSLContext)
+
+
+async def test_single_attempt_mode_fails_fast_on_rate_limit() -> None:
+    """In a fallback chain the chain is the retry: a rate-limited link must hand over at once
+    instead of sleeping out the provider's retry delay (measured: ~95 s of dead air per turn)."""
+    attempts = {"n": 0}
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        attempts["n"] += 1
+        return httpx2.Response(429, json={"error": {"message": "rate limited"}})
+
+    llm = OpenAICompatLLM(
+        api_key="k",
+        model="m",
+        base_url="https://api.example/v1",
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+        max_attempts=1,
+    )
+    events = [
+        e
+        async for e in llm.stream(
+            [ChatMessage(role="user", content="hi")],
+            [],
+            temperature=0.0,
+            max_tokens=5,
+            timeout_s=5.0,
+        )
+    ]
+    assert attempts["n"] == 1
+    assert isinstance(events[-1], LLMError) and events[-1].code == "rate_limited"

@@ -98,6 +98,7 @@ def _make(
     max_utterance_ms: int = 30_000,
     handler_delay_s: dict[str, float] | None = None,
     principal: Principal | None = None,
+    audio_out: tuple[str, int] = ("wav", 22_050),
 ) -> tuple[TestClient, FakeConversationStore, RecordingTTS]:
     pack = load_pack("farm_marketplace", PACKS_ROOT)
     store = FakeConversationStore()
@@ -123,6 +124,8 @@ def _make(
         speaker="test-voice",
         pace=1.0,
         max_utterance_ms=max_utterance_ms,
+        audio_out_encoding=audio_out[0],  # type: ignore[arg-type]
+        audio_out_sample_rate=audio_out[1],
     )
     return TestClient(app), store, tts
 
@@ -478,3 +481,16 @@ def test_token_expiring_mid_session_closes_before_the_next_turn(
         with pytest.raises(WebSocketDisconnect) as info:
             ws.receive_text()  # raises on the close frame; no turn frames come first
     assert info.value.code == 4401
+
+
+def test_mp3_tts_is_announced_and_labelled() -> None:
+    client, _, _ = _make(
+        stt=ScriptedSTT(_t("नमस्ते")), llm=SequencedLLM(_reply("नमस्ते जी।")), audio_out=("mp3", 24_000)
+    )
+    with client.websocket_connect("/v1/voice") as ws:
+        ready = _start(ws)
+        _speak(ws)
+        messages, _ = _collect_turn(ws)
+    assert ready["audio_out"] == {"encoding": "mp3", "sample_rate": 24000}
+    segment = next(m for m in messages if m["type"] == "audio.segment")
+    assert (segment["encoding"], segment["sample_rate"]) == ("mp3", 24000)

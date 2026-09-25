@@ -41,7 +41,7 @@ def test_gemini_branch_never_falls_back_to_generic_llm_api_key(
     monkeypatch.setattr(
         gemini_llm_module,
         "GeminiLLM",
-        lambda api_key, model: seen_keys.append(api_key) or object(),
+        lambda api_key, model, **_: seen_keys.append(api_key) or object(),
     )
     settings = _settings(gemini_api_key="the-real-gemini-key", llm_api_key="unrelated-vendor-key")
     build_chain_provider("gemini", "gemini-2.5-flash", settings)  # type: ignore[operator]
@@ -57,3 +57,12 @@ def test_groq_uses_groq_credentials(build_chain_provider: object) -> None:
     settings = _settings(groq_api_key="groq-key", groq_base_url="https://api.groq.com/openai/v1")
     provider = build_chain_provider("groq", "openai/gpt-oss-20b", settings)  # type: ignore[operator]
     assert isinstance(provider, OpenAICompatLLM)
+
+
+def test_chain_links_are_built_single_attempt() -> None:
+    from app.main import _build_chain_provider
+    from voice_core.config import Settings
+
+    settings = Settings(gemini_api_key="g", groq_api_key="q")
+    assert _build_chain_provider("gemini", "gemini-2.5-flash", settings)._max_attempts == 1
+    assert _build_chain_provider("groq", "openai/gpt-oss-20b", settings)._max_attempts == 1

@@ -4,12 +4,11 @@ Update after every milestone. Keep it short and factual.
 
 ## Current milestone
 M1, M2, M3 gates PASSED (2026-09-25, see Measured numbers).
-**M4 (push-to-talk voice) code-complete 2026-09-25; latency gate NOT yet measured** — it needs
-`SARVAM_API_KEY` in `backend/.env` (plus `STT_PROVIDER=sarvam`, `TTS_PROVIDER=sarvam`, already
-set). Then: `uv run uvicorn app.main:app --port 8000` and
-`uv run python -m voice_core.evals.latency --synthesize`. Also still open: choosing the female
-voice (`uv run python -m voice_core.evals.audition`, listen, set `voice.tts_speaker` in
-pack.yaml); until then the placeholder speaker `priya` is used with a startup warning.
+**M4 (push-to-talk voice) code-complete; latency gate MEASURED and FAILED 2026-09-25: median
+first audio ≈ 18 s (target ≤ 2.5 s).** Voice uses free providers by user decision (Groq Whisper
+STT + edge-tts TTS; Sarvam adapters kept as the paid option). The LLM stage dominates (5–21 s);
+even with an instant LLM the free STT (~1.7 s) + first TTS (~2.2 s) exceed 2.5 s — see Known
+issues for options. Everything else in M4 works end to end in hi/mr/en.
 
 ## What works
 - Repo layout under `backend/` per CLAUDE.md: `app/`, `voice_core/{ports,adapters,agent,tools,kb,
@@ -191,10 +190,14 @@ pack.yaml); until then the placeholder speaker `priya` is used with a startup wa
 | 2026-09-25 | retrieval (8 cases) | `gemini-embedding-001` @1024, Supabase `voice.match_chunks` | **hit@1 100%, hit@3 100%, MRR 1.000 — M2 gate PASSED.** 4 docs / 13 chunks ingested. mr-IN questions (r-002/005/008) all hit cross-lingually from en/hi docs. Small, easy set — add harder/confusable cases as content grows. |
 | 2026-09-25 | text, write-flow subset (g-009..g-016, g-021..g-025: 13 cases) | `fallback` chain, server-side ConfirmationGate + in-memory store | **13/13 structural PASS, 100% tool selection — M3 gate PASSED.** Includes button confirm (g-023), expiry (g-024), stale-yes (g-025), cancel (g-011), changed args (g-012). 0 unauthorized writes. g-015 (forecast, read-only) failed a wording content check only. Batch 2 ran with the safety-review fixes loaded; batch 1 started just before them (fixes touch edge paths not exercised by those cases). ~3-10 min/case on free-tier rate limits. |
 | 2026-09-25 | redteam (9 cases) | `fallback` chain, M3 code | **9/9 structural PASS, 100%**: injection, identity spoofing, confirmation bypass, out-of-scope all held. rt-009 failed `no_guarantee` only because the scorer flagged the refusal "I can't guarantee a price" — scorer now ignores negated guarantees (en/hi/mr, tested); the reply itself was correct. |
+| 2026-09-25 | latency (6 clips hi/mr/en, edge-tts clips @0.85 pace padded to 5 s) | Groq whisper-large-v3 + edge-tts + `fallback` LLM chain, loopback + 4G model (RTT 120 ms, 2 Mbps) | **M4 gate FAILED: median first audio 17.8 s loopback / 18.0 s 4G-model (p90 19.3 s).** Stage medians: STT ~1.7 s, LLM ~11.3 s (2 rounds + retrieval; gemini-2.5-flash quota exhausted → fails over), first-sentence TTS ~2.2 s. All 6 turns produced audio; transcripts usable (Marathi imperfect). Report: `backend/evals/reports/20260925T122426Z-latency.md`. |
 
 ## Decisions log
 | Date | Decision | Why | Evidence |
 |---|---|---|---|
+| 2026-09-25 | Voice providers: Groq Whisper (`whisper-large-v3`, session-language hint) for STT and edge-tts (female hi-IN-SwaraNeural / mr-IN-AarohiNeural / en-IN-NeerjaNeural, MP3 24 kHz) for TTS, instead of Sarvam | User wants no paid keys. Groq free tier: 20 RPM / 2,000 RPD / 28,800 audio-s/day. Gemini TTS has no free tier; Groq has no hi/mr TTS. edge-tts is free but unofficial (can break). Live probe: Whisper without a hint labels Marathi as Hindi → hint always sent, and auto language switching can't use Whisper detection (explicit switching still works) | `tests/live/test_free_speech.py` 3/3; probes logged in this session |
+| 2026-09-25 | Server froze for minutes (all sockets, even /healthz): **root cause** `httpx2` (OpenAI SDK) defaults to `truststore`, whose Windows backend verifies TLS certificate chains with a blocking OS call on the event-loop thread | py-spy dumps (3× over 2 min) all in `truststore._windows._get_and_verify_cert_chain`. Fix: `OpenAICompatLLM` passes an explicit certifi SSL context. Only httpx2/httpcore2 use truststore in this venv. This also explains the ~10 min/case eval runs earlier today | `tests/test_openai_compat_llm.py::test_default_http_client_never_uses_truststore` |
+| 2026-09-25 | Fallback-chain links now make 1 attempt (`max_attempts=1`) and the OpenAI SDK's own retries are off (`max_retries=0`) | A rate-limited first link slept out 30–60 s retry-after delays (twice: our loop + SDK) before failing over — ~95 s of dead air per voice turn. The chain itself is the retry. Single-provider mode keeps 3 attempts | `test_single_attempt_mode_fails_fast_on_rate_limit`, `test_chain_links_are_built_single_attempt` |
 | 2026-09-16 | M0 scaffold rebuilt from scratch | Prior session's reported commit `ba95ae1` never existed in git history; `backend/` was absent from the working tree | `git log --all` showed only `202227e`, `1ffdd45` before this change |
 | 2026-09-16 | Fixed `get_my_listings` `result_fields` in `domain_packs/farm_marketplace/tools.yaml` from a flat field list (`listing_ref, crop, quantity_kg, status, bidding_ends_at, harvest_date`) to `[listings]` | The fixture (`fixtures/listings.json`) nests every listing under a top-level `listings` array; `ToolRegistry.dispatch`'s trimming (`voice_core/tools/registry.py`) only keeps *top-level* keys matching `result_fields`, so the old list matched nothing and the LLM always received `{}` for this tool — starving it of data for every case that needed "which listing" (g-013, g-014, g-016, g-020, and indirectly cases that fall back to it via `resolve_for_confirm`) | Confirmed by reading `fixtures/bids.json`/`orders.json`/`pickups.json` (all flat, `result_fields` match) vs `listings.json` (nested); added `tests/test_tool_registry.py::test_dispatch_get_my_listings_returns_nested_listings` as a regression test |
 | 2026-09-16 | Gated `FakeAuthVerifier` in `app/main.py` behind `settings.app_env == "dev"`; non-dev startup now raises `RuntimeError` instead of silently wiring the static `dev-token` bypass | `voice-safety-reviewer` subagent flagged this as a BLOCKER-in-waiting: the code wired `FakeAuthVerifier` unconditionally while a comment claimed it was dev-only — not exploitable today (no real host/writes exist pre-M3) but exactly the kind of thing that survives into M3/M4 by inertia if not fixed now | `backend/tests/test_main.py` covers both branches |
@@ -206,6 +209,14 @@ pack.yaml); until then the placeholder speaker `priya` is used with a startup wa
 | 2026-09-22 | Follow-up fixes from `voice-safety-reviewer` on the fallback-chain diff: (1) `FallbackLLM`'s defensive `for...else` branch (a sub-provider stream ending without `Done`/`LLMError`) now synthesizes an `LLMError` instead of silently returning nothing, so the "every stream ends in Done or LLMError" contract holds even for a hypothetical buggy future adapter; (2) `_build_chain_provider` (in both `app/main.py` and `evals/run.py`) now raises `ValueError` immediately if a chain entry is missing a model (e.g. a bare `gemini` with no `:model`), instead of silently constructing a provider with an empty model string that would only fail at call time; (3) removed the `gemini_api_key or llm_api_key` cross-vendor fallback — `GEMINI_API_KEY` must now be set explicitly for chain mode, since the old fallback could silently send an unrelated vendor's key (from `LLM_API_KEY`, e.g. an Anthropic/OpenAI-compat key from single-provider mode) to Google's endpoint with no warning | Reviewer flagged the cross-vendor key fallback as a real credential-leak footgun (not logged, not committed, but a real risk if a user has `LLM_API_KEY` set for something else and forgets `GEMINI_API_KEY`); the other two were correctness/robustness gaps in freshly-added code, not exploitable today but worth closing before this becomes load-bearing | New `backend/tests/test_llm_wiring.py`: missing-model raises, unknown-provider raises, and a regression test (`test_gemini_branch_never_falls_back_to_generic_llm_api_key`) that monkeypatches `GeminiLLM` to capture the `api_key` it's constructed with and asserts it's never the unrelated `llm_api_key` value |
 
 ## Known issues
+- **M4 latency gate fails with the free stack (≈18 s vs 2.5 s).** Options, cheapest first:
+  (1) put a Groq model first in `LLM_FALLBACK_CHAIN` (gemini-2.5-flash's 20/day free quota is
+  exhausted daily, costing a failed call per LLM round); (2) cut LLM work per turn (smaller/faster
+  model, fewer tokens, skip auto-retrieval for obvious data questions); (3) play the pack filler
+  immediately after STT so the user hears something within ~2 s (perceived latency only — not a
+  real fix); (4) paid STT/TTS (Sarvam adapters exist) and a paid LLM tier. SPEC's 2.5 s budget
+  assumed STT ≤ 0.9 s and TTS ≤ 0.5 s; the free STT+TTS alone take ~4 s.
+- `transcript.final.confidence` is 0.0 with Whisper (no confidence available).
 - **M4 not done until measured:** latency gate (median first audio ≤ 2.5 s, 4G-like) and the
   Android-phone check are unmeasured — no `SARVAM_API_KEY` yet. The 4G figure is a model
   (loopback + RTT + first-segment download), not a real mobile network.

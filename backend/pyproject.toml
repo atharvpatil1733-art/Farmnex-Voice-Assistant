@@ -15,6 +15,7 @@ dependencies = [
     "tzdata>=2026.4",
     "asyncpg>=0.31.0",
     "openai>=3.17.0",
+    "edge-tts>=7.2.8",
 ]
 
 [dependency-groups]
@@ -28,6 +29,8 @@ dev = [
     "types-pyyaml>=6.0.12.20260906",
     "httpx2>=2.13.0",
     "websockets>=16.1",
+    "miniaudio>=1.71",
+    "py-spy>=0.4.2",
 ]
 
 [tool.pytest.ini_options]

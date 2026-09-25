@@ -41,10 +41,11 @@ class Settings(BaseSettings):
     groq_base_url: str = "https://api.groq.com/openai/v1"
 
     # STT / TTS
-    stt_provider: Literal["sarvam", "fake"] = "fake"
-    stt_model: str = "saaras:v3"
+    stt_provider: Literal["sarvam", "groq", "fake"] = "fake"
+    stt_model: str = "saaras:v3"  # Sarvam model
+    groq_stt_model: str = "whisper-large-v3"  # best hi/mr accuracy in our probe, 2026-09-25
     stt_mode: str = "transcribe"
-    tts_provider: Literal["sarvam", "fake"] = "fake"
+    tts_provider: Literal["sarvam", "edge", "fake"] = "fake"
     tts_model: str = "bulbul:v3"
     tts_speaker: str = ""  # overrides pack.yaml voice.tts_speaker when set
     sarvam_api_key: str = ""

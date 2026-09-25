@@ -50,7 +50,6 @@ SESSION_START_TIMEOUT_S = 5.0
 FILLER_AFTER_S = 1.2
 HISTORY_MESSAGES = 16  # SPEC §5: last 8 turns verbatim
 TTS_CONCURRENCY = 2
-OUTPUT_SAMPLE_RATE = 22_050
 PCM_BYTES_PER_MS = 32  # 16 kHz * 2 bytes / 1000
 MAX_AUDIO_FRAME_BYTES = 64 * 1024  # also run uvicorn with --ws-max-size 65536
 
@@ -68,6 +67,8 @@ class VoiceDeps:
     speaker: str
     pace: float
     max_utterance_ms: int
+    audio_out_encoding: p.AudioEncoding = "wav"
+    audio_out_sample_rate: int = 22_050
     embeddings: EmbeddingProvider | None = None
     knowledge_store: KnowledgeStore | None = None
     auto_rag_min_sim: float = 0.45
@@ -156,7 +157,9 @@ class VoiceSession:
                 language=language,
                 speaker=self._d.speaker,
                 limits={"max_utterance_ms": self._d.max_utterance_ms},
-                audio_out=p.AudioOut(encoding="wav", sample_rate=OUTPUT_SAMPLE_RATE),
+                audio_out=p.AudioOut(
+                    encoding=self._d.audio_out_encoding, sample_rate=self._d.audio_out_sample_rate
+                ),
             )
         )
         return True
@@ -589,7 +592,8 @@ class _Turn:
                     p.AudioSegmentHeader(
                         turn_id=self.turn_id,
                         seq=self.seq,
-                        sample_rate=OUTPUT_SAMPLE_RATE,
+                        encoding=self.d.audio_out_encoding,
+                        sample_rate=self.d.audio_out_sample_rate,
                         byte_length=len(data),
                         is_last=final and index == len(spoken) - 1,
                     ),
@@ -607,7 +611,8 @@ class _Turn:
                 p.AudioSegmentHeader(
                     turn_id=self.turn_id,
                     seq=self.seq,
-                    sample_rate=OUTPUT_SAMPLE_RATE,
+                    encoding=self.d.audio_out_encoding,
+                    sample_rate=self.d.audio_out_sample_rate,
                     byte_length=0,
                     is_last=True,
                 ),

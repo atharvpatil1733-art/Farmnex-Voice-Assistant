@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI
 
+from voice_core.adapters.edge.tts import EdgeTTS
 from voice_core.adapters.embeddings_factory import build_embeddings
 from voice_core.adapters.fakes.auth import FakeAuthVerifier
 from voice_core.adapters.fakes.conversation import FakeConversationStore
 from voice_core.adapters.fakes.llm import FakeLLM
 from voice_core.adapters.fakes.stt import FakeSTT
 from voice_core.adapters.fakes.tts import FakeTTS
+from voice_core.adapters.groq.stt import GroqWhisperSTT
 from voice_core.adapters.sarvam.client import SarvamClient
 from voice_core.adapters.sarvam.stt import SarvamSTT
 from voice_core.adapters.sarvam.tts import SarvamTTS
@@ -46,12 +50,15 @@ def _build_chain_provider(entry_provider: str, model: str, settings: Settings) -
     if entry_provider == "gemini":
         from voice_core.adapters.gemini.llm import GeminiLLM
 
-        return GeminiLLM(api_key=settings.gemini_api_key, model=model)
+        return GeminiLLM(api_key=settings.gemini_api_key, model=model, max_attempts=1)
     if entry_provider == "groq":
         from voice_core.adapters.openai_compat.llm import OpenAICompatLLM
 
         return OpenAICompatLLM(
-            api_key=settings.groq_api_key, model=model, base_url=settings.groq_base_url
+            api_key=settings.groq_api_key,
+            model=model,
+            base_url=settings.groq_base_url,
+            max_attempts=1,
         )
     raise ValueError(f"unknown provider {entry_provider!r} in LLM_FALLBACK_CHAIN")
 
@@ -127,6 +134,8 @@ PLACEHOLDER_SPEAKER = "priya"  # until a voice is chosen by audition (docs/STATU
 
 def _choose_speaker(settings: Settings, pack: LoadedPack) -> str:
     speaker = settings.tts_speaker or pack.tts_speaker
+    if not speaker and settings.tts_provider == "edge":
+        return "default-female"  # EdgeTTS picks the female voice for each language
     if not speaker:
         if settings.app_env != "dev":
             raise RuntimeError("choose a TTS voice (pack voice.tts_speaker or TTS_SPEAKER)")
@@ -135,28 +144,52 @@ def _choose_speaker(settings: Settings, pack: LoadedPack) -> str:
     return speaker
 
 
-def _build_speech(
-    settings: Settings,
-) -> tuple[STTProvider, TTSProvider, SarvamClient | None]:
-    needs_sarvam = "sarvam" in (settings.stt_provider, settings.tts_provider)
-    if needs_sarvam and not settings.sarvam_api_key:
-        if settings.app_env != "dev":
-            raise RuntimeError("STT/TTS_PROVIDER=sarvam needs SARVAM_API_KEY outside app_env=dev")
-        # Dev only: keep the text API usable while the voice key isn't configured yet.
-        logger.warning("SARVAM_API_KEY not set: /v1/voice uses fake STT/TTS (dev only)")
-        needs_sarvam = False
-    client = SarvamClient(settings.sarvam_api_key) if needs_sarvam else None
-    stt: STTProvider = (
-        SarvamSTT(client, model=settings.stt_model, mode=settings.stt_mode)
-        if client is not None and settings.stt_provider == "sarvam"
-        else FakeSTT()
-    )
-    tts: TTSProvider = (
-        SarvamTTS(client, model=settings.tts_model)
-        if client is not None and settings.tts_provider == "sarvam"
-        else FakeTTS()
-    )
-    return stt, tts, client
+@dataclass
+class Speech:
+    stt: STTProvider
+    tts: TTSProvider
+    audio_encoding: Literal["wav", "mp3"]
+    audio_sample_rate: int
+    closers: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
+
+
+def _key_or_fake(settings: Settings, provider: str, key: str, name: str) -> bool:
+    """True if the provider can be built. Dev without the key falls back to a fake (with a
+    warning) so the text API keeps working; anywhere else a missing key is a startup error."""
+    if key:
+        return True
+    if settings.app_env != "dev":
+        raise RuntimeError(f"{provider} speech provider needs {name} outside app_env=dev")
+    logger.warning("%s not set: /v1/voice uses fake %s (dev only)", name, provider)
+    return False
+
+
+def _build_speech(settings: Settings) -> Speech:
+    closers: list[Callable[[], Awaitable[None]]] = []
+    sarvam: SarvamClient | None = None
+    if "sarvam" in (settings.stt_provider, settings.tts_provider) and _key_or_fake(
+        settings, "sarvam", settings.sarvam_api_key, "SARVAM_API_KEY"
+    ):
+        sarvam = SarvamClient(settings.sarvam_api_key)
+        closers.append(sarvam.aclose)
+
+    stt: STTProvider = FakeSTT()
+    if settings.stt_provider == "sarvam" and sarvam is not None:
+        stt = SarvamSTT(sarvam, model=settings.stt_model, mode=settings.stt_mode)
+    elif settings.stt_provider == "groq" and _key_or_fake(
+        settings, "groq", settings.groq_api_key, "GROQ_API_KEY"
+    ):
+        groq = GroqWhisperSTT(
+            settings.groq_api_key, base_url=settings.groq_base_url, model=settings.groq_stt_model
+        )
+        closers.append(groq.aclose)
+        stt = groq
+
+    if settings.tts_provider == "edge":
+        return Speech(stt, EdgeTTS(), "mp3", 24_000, closers)
+    if settings.tts_provider == "sarvam" and sarvam is not None:
+        return Speech(stt, SarvamTTS(sarvam, model=settings.tts_model), "wav", 22_050, closers)
+    return Speech(stt, FakeTTS(), "wav", 22_050, closers)
 
 
 @asynccontextmanager
@@ -199,7 +232,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.auth_verifier = _build_auth_verifier(settings)
     conversation_store = _build_conversation_store(settings)
     app.state.conversation_store = conversation_store
-    stt, tts, sarvam_client = _build_speech(settings)
+    speech = _build_speech(settings)
     app.state.voice_deps = VoiceDeps(
         pack=pack,
         registry=app.state.registry,
@@ -207,11 +240,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         llm=app.state.llm,
         store=conversation_store,
         auth_verifier=app.state.auth_verifier,
-        stt=stt,
-        tts=tts,
+        stt=speech.stt,
+        tts=speech.tts,
         speaker=_choose_speaker(settings, pack),
         pace=pack.speech_pace,
         max_utterance_ms=settings.max_utterance_seconds * 1000,
+        audio_out_encoding=speech.audio_encoding,
+        audio_out_sample_rate=speech.audio_sample_rate,
         embeddings=embeddings,
         knowledge_store=knowledge_store,
         auto_rag_min_sim=settings.auto_rag_min_sim,
@@ -223,8 +258,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await knowledge_store.close()  # type: ignore[attr-defined]
     if isinstance(conversation_store, SupabaseConversationStore):
         await conversation_store.close()
-    if sarvam_client is not None:
-        await sarvam_client.aclose()
+    for close in speech.closers:
+        await close()
     await http_handler.aclose()
     await graphql_handler.aclose()
 

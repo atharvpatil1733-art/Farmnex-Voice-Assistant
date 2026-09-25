@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 from collections.abc import AsyncIterator
 from typing import Any
 
+import certifi
 import httpx2
 from openai import (
     APIConnectionError,
@@ -56,6 +58,16 @@ def _to_openai_tools(tools: list[ToolSpec]) -> list[dict[str, Any]]:
     ]
 
 
+def certifi_ssl_context() -> ssl.SSLContext:
+    """Plain OpenSSL verification against certifi's CA bundle.
+
+    httpx2 (the OpenAI SDK's HTTP client) defaults to `truststore`, which on Windows verifies the
+    certificate chain with a *blocking* OS call on the event-loop thread. py-spy caught the whole
+    server frozen for minutes inside truststore._windows._get_and_verify_cert_chain (2026-09-25),
+    so every async server here must avoid it."""
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 class OpenAICompatLLM:
     """LLMProvider over any OpenAI-compatible chat-completions endpoint (Groq, OpenRouter,
     a local Ollama, ...). Non-streaming: the whole reply is fetched, then replayed as events."""
@@ -68,8 +80,17 @@ class OpenAICompatLLM:
         model: str,
         base_url: str,
         http_client: httpx2.AsyncClient | None = None,
+        max_attempts: int = _MAX_ATTEMPTS,
     ) -> None:
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+        # 1 inside a fallback chain: the chain is the retry, don't sleep out rate limits.
+        self._max_attempts = max(1, max_attempts)
+        if http_client is None:
+            http_client = httpx2.AsyncClient(verify=certifi_ssl_context())
+        # max_retries=0: the SDK otherwise retries 429s itself (sleeping out retry-after) on top
+        # of our own loop, so a rate-limited provider stalled the whole voice turn.
+        self._client = AsyncOpenAI(
+            api_key=api_key, base_url=base_url, http_client=http_client, max_retries=0
+        )
         self._model = model
 
     async def stream(
@@ -84,7 +105,7 @@ class OpenAICompatLLM:
         oa_messages = _to_openai_messages(messages)
         oa_tools = _to_openai_tools(tools)
 
-        for attempt in range(_MAX_ATTEMPTS):
+        for attempt in range(self._max_attempts):
             try:
                 completion = await self._client.with_options(
                     timeout=timeout_s
@@ -102,19 +123,19 @@ class OpenAICompatLLM:
                 # DNS/connection failures. Must stay below APITimeoutError, which subclasses
                 # this. Without it these escape uncaught and deny the caller (e.g.
                 # FallbackLLM) any chance to try another provider.
-                if attempt < _MAX_ATTEMPTS - 1:
+                if attempt < self._max_attempts - 1:
                     await asyncio.sleep(_DEFAULT_RETRY_DELAY_S)
                     continue
                 yield LLMError(code="unavailable", message=str(exc), retryable=True)
                 return
             except RateLimitError as exc:
-                if attempt < _MAX_ATTEMPTS - 1:
+                if attempt < self._max_attempts - 1:
                     await asyncio.sleep(_retry_delay_seconds(exc))
                     continue
                 yield LLMError(code="rate_limited", message=str(exc), retryable=True)
                 return
             except APIStatusError as exc:
-                if exc.status_code >= 500 and attempt < _MAX_ATTEMPTS - 1:
+                if exc.status_code >= 500 and attempt < self._max_attempts - 1:
                     await asyncio.sleep(_DEFAULT_RETRY_DELAY_S)
                     continue
                 code = "unavailable" if exc.status_code >= 500 else "bad_request"

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import io
 import json
 import os
 import statistics
@@ -27,6 +26,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from voice_core.speech.audio import pcm16_to_wav
 
 PCM_RATE = 16_000
 CHUNK_BYTES = 3_200  # 100 ms of 16 kHz PCM16
@@ -80,27 +81,39 @@ def load_samples(pack_id: str | None) -> dict[str, Any]:
     return data
 
 
-async def synthesize_clips(out_dir: Path, pack_id: str | None) -> None:
-    from voice_core.adapters.sarvam.client import SarvamClient
-    from voice_core.adapters.sarvam.tts import SarvamTTS
-    from voice_core.config import get_settings
+def mp3_to_pcm16(mp3: bytes) -> bytes:
+    """Decode MP3 to 16 kHz mono PCM16 (the push-to-talk wire format). Dev-only dependency."""
+    import miniaudio  # type: ignore[import-untyped]  # dev-only: just this tool decodes audio
 
-    settings = get_settings()
+    decoded = miniaudio.decode(
+        mp3, output_format=miniaudio.SampleFormat.SIGNED16, nchannels=1, sample_rate=PCM_RATE
+    )
+    pcm: bytes = decoded.samples.tobytes()
+    return pcm
+
+
+async def synthesize_clips(out_dir: Path, pack_id: str | None) -> None:
+    """Make test utterances with the free edge-tts voices (slowed down, like a careful speaker).
+    Which TTS made the clips doesn't affect the measurement; the server's STT hears them."""
+    from voice_core.adapters.edge.tts import EdgeTTS
+
     utterances = load_samples(pack_id).get("latency") or []
-    client = SarvamClient(settings.sarvam_api_key)
-    tts = SarvamTTS(client, sample_rate=PCM_RATE)
+    tts = EdgeTTS()
     out_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        for index, item in enumerate(utterances):
-            language, text = item["language"], item["text"]
-            segment = await tts.synthesize(text, language, settings.tts_speaker or "priya", 0.85)
-            (out_dir / f"{index:02d}-{language}.wav").write_bytes(segment.data)
-    finally:
-        await client.aclose()
+    for index, item in enumerate(utterances):
+        language, text = item["language"], item["text"]
+        segment = await tts.synthesize(text, language, "", 0.85)
+        pcm = mp3_to_pcm16(segment.data)
+        (out_dir / f"{index:02d}-{language}.wav").write_bytes(pcm16_to_wav(pcm))
 
 
 async def measure_clip(
-    url: str, token: str, language: str, pcm: bytes, network: NetworkProfile
+    url: str,
+    token: str,
+    language: str,
+    pcm: bytes,
+    network: NetworkProfile,
+    turn_timeout_s: float = 180.0,
 ) -> dict[str, Any]:
     from websockets.asyncio.client import connect
 
@@ -121,7 +134,7 @@ async def measure_clip(
         server: dict[str, int] = {}
         errors: list[str] = []
         while True:
-            frame = await asyncio.wait_for(ws.recv(), timeout=60)
+            frame = await asyncio.wait_for(ws.recv(), timeout=turn_timeout_s)
             if isinstance(frame, bytes):
                 if first_audio_ms is None:
                     first_audio_ms = (time.perf_counter() - started) * 1000
@@ -196,7 +209,9 @@ async def _main(args: argparse.Namespace) -> int:
         for clip in clips:
             language = clip.stem.split("-", 1)[1] if "-" in clip.stem else "hi-IN"
             pcm = pad_pcm(read_wav_pcm(clip))
-            result = await measure_clip(args.url, token, language, pcm, network)
+            result = await measure_clip(
+                args.url, token, language, pcm, network, args.turn_timeout_s
+            )
             results.append(result)
             print(f"[{repeat}] {clip.name}: {result['first_audio_ms'] or 0:.0f} ms loopback")
     path = write_report(results, network, Path(args.reports))
@@ -214,6 +229,7 @@ def main() -> None:
     parser.add_argument("--clips", default="evals/latency_clips")
     parser.add_argument("--synthesize", action="store_true", help="make clips with Sarvam TTS")
     parser.add_argument("--repeat", type=int, default=2)
+    parser.add_argument("--turn-timeout-s", type=float, default=180.0)
     parser.add_argument("--rtt-ms", type=float, default=120.0)
     parser.add_argument("--downlink-kbps", type=float, default=2_000.0)
     parser.add_argument("--reports", default="evals/reports")
@@ -222,13 +238,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-def _wav_bytes(pcm: bytes) -> bytes:  # used by tests
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(PCM_RATE)
-        wav.writeframes(pcm)
-    return buffer.getvalue()

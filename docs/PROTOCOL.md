@@ -88,6 +88,9 @@ Error codes: `AUTH_FAILED`, `CONSENT_REQUIRED`, `PROTOCOL_ERROR`, `UTTERANCE_TOO
 - `audio.segment` seq starts at 0 per turn and is strictly increasing; client plays in order and
   discards segments from turns older than the latest `turn_id`.
 - `confirm.response` for an unknown/expired `action_id` → `action.result` with `expired`.
+- `audio_out.encoding` / `audio.segment.encoding` is `wav` or `mp3` (depends on the server's TTS
+  provider; added in v1 as an additive change). A segment with `byte_length: 0` and `is_last: true`
+  only marks the end of the turn's audio.
 - If TTS fails for a sentence, the server still sends `assistant.text.final` (captions) and an
   `error` with `TTS_FAILED`; the client shows the text.
 - Version bump rules: additive fields = same version; renamed/removed fields = `protocol_version` + 1.

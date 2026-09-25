@@ -52,7 +52,9 @@ def _retry_delay_seconds(message: str) -> float:
 class GeminiLLM:
     name = "gemini"
 
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, *, max_attempts: int = _MAX_ATTEMPTS) -> None:
+        # 1 inside a fallback chain: the chain is the retry, don't sleep out rate limits.
+        self._max_attempts = max(1, max_attempts)
         self._client = genai.Client(api_key=api_key)
         self._model = model
 
@@ -83,7 +85,7 @@ class GeminiLLM:
             http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),
         )
 
-        for attempt in range(_MAX_ATTEMPTS):
+        for attempt in range(self._max_attempts):
             seen_calls: set[tuple[str, str]] = set()
             usage = Usage(input_tokens=0, output_tokens=0)
             emitted_any = False
@@ -121,7 +123,7 @@ class GeminiLLM:
                 # DNS/connection failures (httpx.ConnectError and friends) are NOT
                 # google.genai APIErrors, so without this they escape uncaught and deny the
                 # caller (e.g. FallbackLLM) any chance to try another provider.
-                if not emitted_any and attempt < _MAX_ATTEMPTS - 1:
+                if not emitted_any and attempt < self._max_attempts - 1:
                     await asyncio.sleep(_DEFAULT_RETRY_DELAY_S)
                     continue
                 yield LLMError(code="unavailable", message=str(exc), retryable=True)
@@ -131,14 +133,14 @@ class GeminiLLM:
                 # A request that already emitted content must not be retried (SPEC: never retry
                 # after the first token was emitted); a 429/5xx fails before any content, so a
                 # bounded retry-with-backoff here stays within "retry only idempotent calls".
-                if is_rate_limited and not emitted_any and attempt < _MAX_ATTEMPTS - 1:
+                if is_rate_limited and not emitted_any and attempt < self._max_attempts - 1:
                     await asyncio.sleep(_retry_delay_seconds(str(exc)))
                     continue
                 code = "rate_limited" if is_rate_limited else "bad_request"
                 yield LLMError(code=code, message=str(exc), retryable=is_rate_limited)
                 return
             except ServerError as exc:
-                if not emitted_any and attempt < _MAX_ATTEMPTS - 1:
+                if not emitted_any and attempt < self._max_attempts - 1:
                     await asyncio.sleep(_DEFAULT_RETRY_DELAY_S)
                     continue
                 yield LLMError(code="unavailable", message=str(exc), retryable=True)

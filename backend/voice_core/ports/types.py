@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
-AudioFormat = Literal["pcm_s16le_16k", "wav_22050"]
+AudioFormat = Literal["pcm_s16le_16k", "wav_22050", "mp3_24k"]
 
 
 @dataclass(frozen=True)

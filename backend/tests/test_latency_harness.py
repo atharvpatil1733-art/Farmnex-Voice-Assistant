@@ -10,13 +10,13 @@ from fastapi import FastAPI
 
 from voice_core.evals.latency import (
     NetworkProfile,
-    _wav_bytes,
     measure_clip,
     pad_pcm,
     percentile,
     read_wav_pcm,
     write_report,
 )
+from voice_core.speech.audio import pcm16_to_wav
 
 
 def test_percentile_and_padding() -> None:
@@ -34,7 +34,7 @@ def test_network_model_adds_rtt_and_first_segment_download() -> None:
 
 def test_wav_reader_rejects_wrong_format(tmp_path: Path) -> None:
     good = tmp_path / "a.wav"
-    good.write_bytes(_wav_bytes(b"\x00\x00" * 10))
+    good.write_bytes(pcm16_to_wav(b"\x00\x00" * 10))
     assert read_wav_pcm(good) == b"\x00\x00" * 10
 
 

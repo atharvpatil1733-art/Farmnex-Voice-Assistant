@@ -9,29 +9,12 @@ REST accepts clips up to 30 s.
 
 from __future__ import annotations
 
-import io
-import wave
-
 from voice_core.adapters.sarvam.client import SarvamClient
 from voice_core.ports.errors import ProviderBadRequest
 from voice_core.ports.types import AudioFormat, Transcript
+from voice_core.speech.audio import MIN_AUDIO_MS, pcm16_duration_ms, pcm16_to_wav
 
-PCM_SAMPLE_RATE = 16_000
-MIN_AUDIO_MS = 300  # shorter = accidental tap; not worth an API call
-
-
-def pcm16_duration_ms(pcm: bytes, sample_rate: int = PCM_SAMPLE_RATE) -> int:
-    return int(len(pcm) / 2 / sample_rate * 1000)
-
-
-def pcm16_to_wav(pcm: bytes, sample_rate: int = PCM_SAMPLE_RATE) -> bytes:
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(sample_rate)
-        wav.writeframes(pcm)
-    return buffer.getvalue()
+__all__ = ["SarvamSTT", "pcm16_to_wav"]
 
 
 class SarvamSTT:

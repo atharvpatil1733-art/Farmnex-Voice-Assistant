@@ -117,8 +117,11 @@ CLIENT_MESSAGE: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)
 # ---------------------------------------------------------------- server -> client
 
 
+AudioEncoding = Literal["wav", "mp3"]  # mp3 added (additive, v1) for TTS providers that emit it
+
+
 class AudioOut(BaseModel):
-    encoding: Literal["wav"]
+    encoding: AudioEncoding
     sample_rate: int
 
 
@@ -183,7 +186,7 @@ class AudioSegmentHeader(_Msg):
     type: Literal["audio.segment"] = "audio.segment"
     turn_id: str
     seq: int = Field(ge=0)
-    encoding: Literal["wav"] = "wav"
+    encoding: AudioEncoding = "wav"
     sample_rate: int
     byte_length: int = Field(ge=0)
     is_last: bool

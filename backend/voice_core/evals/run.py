@@ -38,12 +38,15 @@ def _build_chain_provider(entry_provider: str, model: str, settings: Settings) -
     if entry_provider == "gemini":
         from voice_core.adapters.gemini.llm import GeminiLLM
 
-        return GeminiLLM(api_key=settings.gemini_api_key, model=model)
+        return GeminiLLM(api_key=settings.gemini_api_key, model=model, max_attempts=1)
     if entry_provider == "groq":
         from voice_core.adapters.openai_compat.llm import OpenAICompatLLM
 
         return OpenAICompatLLM(
-            api_key=settings.groq_api_key, model=model, base_url=settings.groq_base_url
+            api_key=settings.groq_api_key,
+            model=model,
+            base_url=settings.groq_base_url,
+            max_attempts=1,
         )
     raise ValueError(f"unknown provider {entry_provider!r} in LLM_FALLBACK_CHAIN")
 
