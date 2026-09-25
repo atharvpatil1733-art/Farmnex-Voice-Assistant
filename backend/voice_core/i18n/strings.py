@@ -19,5 +19,12 @@ CANCELLATION_ACK = {
 }
 
 
+CONFIRM_UNRESOLVED = {
+    "hi-IN": "माफ़ कीजिए, मुझे वह नहीं मिला। कृपया बताइए आप किसकी बात कर रहे हैं।",
+    "mr-IN": "माफ करा, मला ते सापडले नाही. कृपया कोणते ते सांगा.",
+    "en-IN": "Sorry, I couldn't find that. Please tell me which one you mean.",
+}
+
+
 def get(strings: dict[str, str], language: str, default_language: str = "en-IN") -> str:
     return strings.get(language, strings[default_language])

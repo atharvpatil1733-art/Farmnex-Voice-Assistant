@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -219,14 +220,18 @@ class ToolRegistry:
         from voice_core.kb.retriever import search_knowledge
 
         domain = args.get("domain")
-        chunks = await search_knowledge(
-            query=args["query"],
-            pack_id=self._pack_id,
-            language=ctx.language,
-            embeddings=self._embeddings,
-            store=self._knowledge_store,
-            domains=[domain] if domain else None,
-        )
+        try:
+            chunks = await search_knowledge(
+                query=args["query"],
+                pack_id=self._pack_id,
+                language=ctx.language,
+                embeddings=self._embeddings,
+                store=self._knowledge_store,
+                domains=[domain] if domain else None,
+            )
+        except Exception:
+            logging.getLogger(__name__).warning("search_knowledge tool call failed", exc_info=True)
+            return ToolResult(status="error", error_code="KNOWLEDGE_STORE_UNAVAILABLE")
         return ToolResult(
             status="ok",
             data={

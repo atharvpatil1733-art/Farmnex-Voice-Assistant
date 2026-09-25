@@ -125,6 +125,43 @@ async def test_write_tool_stub_is_not_executed(pack, registry, ctx) -> None:
     assert result.reply_text  # a rendered confirm question
 
 
+async def test_unresolvable_confirm_fields_do_not_crash_or_create_pending_action(
+    pack, registry, ctx
+) -> None:
+    """A write whose args match no record can't fill its confirm template. The turn must
+    neither raise nor propose a write the user can't verify (golden rule 4)."""
+    handler = SpyMockToolHandler(pack.pack_dir)
+    llm = SequencedFakeLLM(
+        [
+            [
+                ToolCall(
+                    id="1",
+                    name="request_crop_rescue",
+                    args_json='{"listing_ref":"L-does-not-exist","days_left":2}',
+                ),
+                Done(usage=Usage(0, 0)),
+            ],
+        ]
+    )
+
+    result = await run_text_turn(
+        pack=pack,
+        registry=registry,
+        handler=handler,
+        llm=llm,
+        ctx=ctx,
+        language="hi-IN",
+        history=[],
+        user_text="my crop is spoiling",
+    )
+
+    assert result.pending_action is None
+    assert result.pending_write_args is None
+    assert result.executed is False
+    assert "request_crop_rescue" not in handler.calls
+    assert result.reply_text
+
+
 async def test_yes_confirmation_executes_stored_args(pack, registry, ctx) -> None:
     handler = SpyMockToolHandler(pack.pack_dir)
     pending = PendingWrite(tool="accept_bid", args={"listing_ref": "L-102", "bid_ref": "B-9"})
@@ -223,6 +260,36 @@ async def test_auto_retrieve_injects_knowledge_and_records_it_used(pack, registr
     )
 
     assert result.knowledge_used == ["pre-bidding-basics"]
+
+
+async def test_auto_retrieve_failure_does_not_crash_the_turn(pack, registry, ctx) -> None:
+    """A flaky knowledge-store connection (e.g. a transient DB error) must degrade to
+    'no extra knowledge this turn', not blow up the whole agent turn."""
+    from voice_core.adapters.fakes.embeddings import FakeEmbedding
+
+    class _BrokenKnowledgeStore:
+        async def match(self, *args, **kwargs):
+            raise ConnectionError("simulated transient DB failure")
+
+    handler = SpyMockToolHandler(pack.pack_dir)
+    llm = FakeLLM([TextDelta(text="here you go"), Done(usage=Usage(0, 0))])
+
+    result = await run_text_turn(
+        pack=pack,
+        registry=registry,
+        handler=handler,
+        llm=llm,
+        ctx=ctx,
+        language="en-IN",
+        history=[],
+        user_text="how long is pre-bidding open?",
+        embeddings=FakeEmbedding(dim=4),
+        knowledge_store=_BrokenKnowledgeStore(),
+        auto_rag_min_sim=0.45,
+    )
+
+    assert result.knowledge_used == []
+    assert result.reply_text == "here you go"
 
 
 async def test_no_knowledge_used_without_wiring(pack, registry, ctx) -> None:

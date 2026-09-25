@@ -24,13 +24,21 @@ class Settings(BaseSettings):
     supabase_jwks_url: str = ""
     supabase_jwt_secret: str = ""
 
-    # LLM
+    # LLM (single-provider mode — used when llm_fallback_chain is empty)
     llm_provider: Literal["openai_compat", "sarvam", "gemini", "anthropic", "fake"] = "fake"
     llm_model: str = ""
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_temperature: float = 0.2
     llm_timeout_s: float = 12.0
+
+    # LLM fallback chain mode — comma-separated "provider:model" entries tried in order,
+    # e.g. "gemini:gemini-2.5-flash,groq:openai/gpt-oss-120b". Empty means single-provider
+    # mode above is used instead. Each chain provider has its own credentials below.
+    llm_fallback_chain: str = ""
+    gemini_api_key: str = ""
+    groq_api_key: str = ""
+    groq_base_url: str = "https://api.groq.com/openai/v1"
 
     # STT / TTS
     stt_provider: Literal["sarvam", "fake"] = "fake"

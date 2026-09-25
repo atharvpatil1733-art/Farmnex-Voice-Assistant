@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import asyncpg
 
 from voice_core.ports.types import Chunk, KBChunk, KBDocument
+
+
+def _to_timestamptz(value: str | None) -> datetime | None:
+    """asyncpg needs a datetime for timestamptz; the port carries ISO 8601 strings.
+    A date or naive datetime is taken as UTC (CLAUDE.md: store UTC)."""
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _encode_vector(value: list[float]) -> str:
@@ -115,7 +126,7 @@ class SupabaseKnowledgeStore:
                 doc.audience,
                 doc.source_path,
                 doc.content_hash,
-                doc.effective_from,
+                _to_timestamptz(doc.effective_from),
             )
             document_id = row["id"]
 

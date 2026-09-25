@@ -3,11 +3,10 @@
 Update after every milestone. Keep it short and factual.
 
 ## Current milestone
-M2 — knowledge (RAG) code complete, gate blocked on infra (see Known issues). M1's own
-gate (≥85% tool-selection accuracy) also remains unverified for the same reason — see
-Known issues. Per explicit user direction, M2 started before M1's gate was confirmed;
-this is a deliberate deviation from CLAUDE.md's "don't start the next milestone until
-the current gate is true" rule, not an accidental skip.
+**M1 gate PASSED 2026-09-25: 90.5% tool-selection accuracy (19/21 counted), 0 unauthorized
+writes. M2 gate PASSED 2026-09-25: retrieval hit@3 100% (8/8), hit@1 100%, MRR 1.0.**
+Next: M3 (confirmation state machine + real tools). Carry the M3 must-fix items listed under
+Known issues (client-trusted pending write, 'latest' sentinel pinning, superseded-pending signal).
 
 ## What works
 - Repo layout under `backend/` per CLAUDE.md: `app/`, `voice_core/{ports,adapters,agent,tools,kb,
@@ -88,6 +87,9 @@ the current gate is true" rule, not an accidental skip.
 | Date | Suite | Provider config | Key metrics |
 |---|---|---|---|
 | 2026-09-16 | text (golden, 20 cases) | gemini:gemini-2.5-flash | 31.6% tool-selection accuracy — **not trustworthy**, see known issues |
+| 2026-09-23 | text (golden, all 20 cases) | `fallback` chain (gemini-2.5-flash → gpt-oss-120b → gemini-3.5-flash → gpt-oss-20b) | **63.2% tool-selection accuracy (12/19 counted) — M1 gate FAILED (needs ≥85%)**. First trustworthy measurement: no quota exhaustion, real tool calls throughout. Run in 3 batches via `--offset` (9 + 6 + 5) because the host kept running out of memory; per-batch: 88.9% / 50.0% / 25.0%. 0 unauthorized writes observed. |
+| 2026-09-25 | text (golden, all 22 cases) | `fallback` chain (same as above), KB connected with gemini embeddings | **90.5% tool-selection accuracy (19/21 counted) — M1 gate PASSED.** Batches (8 + 7 + 7, host at ~4-15% free RAM): 87.5% / 100% / 83.3%. Fails: g-001 (empty reply, 2 of 3 attempts — consistent, unexplained), g-020 (called `get_bids_for_listing` instead of asking which listing; conflicts with persona.md's "act on current listing" rule, see Known issues). 0 unauthorized writes; only g-010 executed, after a spoken "हाँ". Before the prompt fixes the same day, a partial run scored 75% / 42.9%. |
+| 2026-09-25 | retrieval (8 cases) | `gemini-embedding-001` @1024, Supabase `voice.match_chunks` | **hit@1 100%, hit@3 100%, MRR 1.000 — M2 gate PASSED.** 4 docs / 13 chunks ingested. mr-IN questions (r-002/005/008) all hit cross-lingually from en/hi docs. Small, easy set — add harder/confusable cases as content grows. |
 
 ## Decisions log
 | Date | Decision | Why | Evidence |
@@ -98,8 +100,96 @@ the current gate is true" rule, not an accidental skip.
 | 2026-09-18 | Embeddings: `gemini-embedding-001` via `output_dimensionality=1024`, not local `BAAI/bge-m3` (SPEC's default candidate) | Host machine was at ~5% free RAM this session (see M1 known issues); loading a multi-GB local model was too risky, and Gemini's API already matches the migration's `vector(1024)` exactly with no schema change. Verified live: 1024-dim output confirmed, cosine similarity unaffected by non-unit norm since pgvector's `<=>` operator normalizes internally | `voice_core/adapters/gemini/embeddings.py`; manual verification via `client.aio.models.embed_content` before writing the adapter |
 | 2026-09-18 | Flipped the 4 sample knowledge docs from `status: draft` to `active` | They were placeholder content explicitly marked "SAMPLE — replace with the real rules, then set active"; drafts are never retrieved, so the retrieval gate can't be measured at all without activating something. Reasonable enough as real placeholder content for a prototype | `domain_packs/farm_marketplace/knowledge/**/*.md` front matter |
 | 2026-09-18 | `0001_voice_core.sql` applied directly to the live Supabase project via the MCP `apply_migration` tool, not `supabase db push` from a local CLI | No local Supabase CLI session was set up this session; the MCP tool was already available and the migration file was unchanged from what M0/M1 wrote | `mcp__claude_ai_Supabase__list_tables` confirmed all 8 `voice.*` tables afterward |
+| 2026-09-22 | Added `voice_core/adapters/openai_compat/llm.py` — a second `LLMProvider` adapter over any OpenAI-compatible chat-completions endpoint (default target: Groq's free tier, `https://api.groq.com/openai/v1`), wired into `app/main.py::_build_llm` and `evals/run.py::_resolve_llm` as `openai_compat:<model>` | Gemini's 20-request/day free quota made the M1 gate (20 golden cases, multi-round/multi-turn) unrunnable in one sitting; the user wants a fully free path while staying able to swap to a paid vendor later without core changes — `config.py` already reserved `llm_provider=openai_compat` + `LLM_BASE_URL` for exactly this | `backend/tests/test_openai_compat_llm.py` (message flattening, text/tool-call replies, 429 retry, 400 → LLMError, all via `httpx2.MockTransport`, no network); `backend/tests/live/test_openai_compat_llm.py` (`@pytest.mark.live`, skipped until `LLM_API_KEY`/`LLM_BASE_URL` are set) |
+| 2026-09-22 | Added `voice_core/adapters/fallback/llm.py::FallbackLLM` — an `LLMProvider` that tries an ordered list of other providers, advancing to the next only on a *pre-output* failure (never mid-answer, preserving "never retry after first token"). Configured via new `LLM_FALLBACK_CHAIN` setting (comma-separated `provider:model`, e.g. `gemini:gemini-2.5-flash,groq:openai/gpt-oss-120b,gemini:gemini-3.5-flash,groq:openai/gpt-oss-20b`) with dedicated `GEMINI_API_KEY`/`GROQ_API_KEY`/`GROQ_BASE_URL` settings; wired into both `app/main.py::_build_llm` and `evals/run.py::_resolve_llm` (`--llm fallback` or `--llm fallback:<chain>`). Single-provider `LLM_PROVIDER`/`LLM_MODEL` mode is unchanged and still used whenever `LLM_FALLBACK_CHAIN` is empty | User wants resilience against any one provider's free-tier limits/outages (Gemini's 20 req/day and past `503`s, Groq's own per-model caps) without a manual switch, ranked by output quality rather than a strict "all Gemini then all Groq" order; chain order chosen from Google's/Groq's current docs (fetched live this session) plus this project's own history — `gemini-2.5-flash` first because it's the one proven reliable in a real gate run, `gemini-3.8-flash` deliberately excluded for now (persistent `503 UNAVAILABLE` in earlier sessions, see Known issues) | `backend/tests/test_fallback_llm.py`: first-provider-succeeds (second never called), falls through on pre-output error, does *not* fall through once output started (text or tool call), all-providers-fail yields the last error, a `ToolCall` also counts as "output started" — all via scripted fake sub-providers, no network |
+| 2026-09-22 | Follow-up fixes from `voice-safety-reviewer` on the fallback-chain diff: (1) `FallbackLLM`'s defensive `for...else` branch (a sub-provider stream ending without `Done`/`LLMError`) now synthesizes an `LLMError` instead of silently returning nothing, so the "every stream ends in Done or LLMError" contract holds even for a hypothetical buggy future adapter; (2) `_build_chain_provider` (in both `app/main.py` and `evals/run.py`) now raises `ValueError` immediately if a chain entry is missing a model (e.g. a bare `gemini` with no `:model`), instead of silently constructing a provider with an empty model string that would only fail at call time; (3) removed the `gemini_api_key or llm_api_key` cross-vendor fallback — `GEMINI_API_KEY` must now be set explicitly for chain mode, since the old fallback could silently send an unrelated vendor's key (from `LLM_API_KEY`, e.g. an Anthropic/OpenAI-compat key from single-provider mode) to Google's endpoint with no warning | Reviewer flagged the cross-vendor key fallback as a real credential-leak footgun (not logged, not committed, but a real risk if a user has `LLM_API_KEY` set for something else and forgets `GEMINI_API_KEY`); the other two were correctness/robustness gaps in freshly-added code, not exploitable today but worth closing before this becomes load-bearing | New `backend/tests/test_llm_wiring.py`: missing-model raises, unknown-provider raises, and a regression test (`test_gemini_branch_never_falls_back_to_generic_llm_api_key`) that monkeypatches `GeminiLLM` to capture the `api_key` it's constructed with and asserts it's never the unrelated `llm_api_key` value |
 
 ## Known issues
+- **Resolved 2026-09-25:** the write-flow failures below. Root behaviour was the model
+  *announcing* an action ("देखी जा रही हैं", "तपासत आहे", "स्वीकार की जा रही है") and ending its
+  turn without the tool call, plus writing its own confirmation question when the user corrected
+  a pending request. Two domain-agnostic core prompt rules fixed it (changes `prompt_hash`).
+  Also fixed: `render_confirm_template` KeyError crashed the turn (now returns localized
+  `CONFIRM_UNRESOLVED`, no pending action); `request_crop_rescue` no longer accepts 'latest'
+  (its confirm can't name the crop from an unresolvable ref); the Devanagari `_normalize` bug
+  (fixed earlier, entry below is stale); symbol-only lexicon entries can no longer match empty
+  input; eval scorer: nested fields, Devanagari digits, spoken dates, digit-boundary numbers;
+  embeddings silently fell back to FAKE vectors when `EMBEDDING_PROVIDER=local` (now raises) and
+  used `LLM_API_KEY` instead of `GEMINI_API_KEY`; `effective_from` str→timestamptz ingest crash.
+  **Your `backend/.env` must now set `EMBEDDING_PROVIDER=gemini`** (it was `local`), or the app
+  refuses to start.
+- **M3 must-fix (from voice-safety-reviewer, 2026-09-25):** (1) `accept_bid` stores
+  `listing_ref: 'latest'` in the pending args, not the concrete listing the user heard confirmed
+  — pin resolved refs into `pending_write_args` generically; unify the two tools' definitions of
+  "latest". (2) When a correction to an in-flight pending write ends with no new pending action,
+  return a `superseded`/`cancelled` pending_status so the M5 confirm card can't execute stale
+  args. (3) Write-tool proposals made right after a tool round (possible prompt injection, see
+  the injected note in `fixtures/bids.json`) need a mechanical guard + redteam case.
+  (4) persona.md "act on the current listing instead of asking" conflicts with g-020 — scope it
+  to write intents or change g-020 deliberately. (5) validate write args against schema before
+  creating a PendingAction. g-021/g-022 lack an mr-IN sibling.
+- `effective_from` date-only values are stored as UTC midnight (05:30 IST).
+- **Root cause of the write-tool failures identified (2026-09-24), fixes applied, NOT yet
+  re-measured.** Per-case reply capture showed the model was *simulating the confirmation
+  itself* — e.g. g-009 replied "क्या आप ... सबसे ऊँची बोली (B-9) स्वीकार करना चाहते हैं?" in
+  free text instead of calling `accept_bid` and letting the core's PendingAction gate speak the
+  confirm template. It treats a write-tool call as if it executes the action, so it hedges, and
+  every downstream turn-indexed expectation (`executed`, `pending_status`, ...) then fails by
+  one turn. Two earlier hypotheses were checked and disproved: `bid_ref` is *not* trimmed out of
+  `result_fields`, and the yes/no lexicon matches the eval inputs correctly. Fixes applied:
+  (1) core prompt (`agent/prompt.py`) now states that calling such a tool changes nothing by
+  itself and only prepares the confirmation, so the model should call it rather than asking
+  "shall I ...?" first — this is a core-architecture mismatch, not a domain quirk, so it lives
+  in the domain-agnostic rules and **changes `prompt_hash` for all packs**;
+  (2) `accept_bid`/`request_crop_rescue` now document `listing_ref: 'latest'` and tell the model
+  not to ask which listing (safe only because the confirm template names crop/quantity/price, so
+  a wrong default is caught at confirmation);
+  (3) `create_prebid_listing.crop` gained `enum: [onion, tomato, soybean, pomegranate]` plus a
+  translation hint — g-014's only failure was passing 'टमाटर' where the eval wanted 'tomato',
+  which was an underspecified contract, not a model error.
+  Partial evidence the direction is right: after (2), g-009 stopped asking "which listing?" and
+  correctly defaulted to the onion listing and identified B-9; g-010 did reach `accept_bid`.
+  Neither passed yet because of the free-text-confirmation behaviour that (1) targets.
+- **Two new golden cases added (g-021, g-022), suite is now 22 cases.** g-021 (hi-IN) asks to
+  accept a bid on a crop the farmer has no listing for and expects `accept_bid` *not* called —
+  it guards the regression risk introduced by defaulting to 'latest'. g-022 (en-IN) pins the new
+  default behaviour (write proposed, not executed). The four originally-failing `accept_bid`
+  cases were deliberately left unchanged rather than relaxed.
+- **M1 gate measured and FAILED: 63.2% vs the ≥85% bar (2026-09-23).** The failures cluster
+  almost entirely in write/confirmation flows — g-009, g-010, g-011, g-014, g-016 (every
+  write-tool case except g-012), plus g-017 (`set_preferred_language` not called) and g-020
+  (ambiguity should trigger `get_my_listings`). Notably **every failing case still passes its
+  content checks**: the assistant produces sensible-sounding replies while not invoking the
+  right tool. Evidence points to the model failing to *propose* the write in the first turn
+  rather than the confirmation state machine misbehaving — g-009 is turn 1 of g-010 in
+  isolation and fails on `pending_action`, and `run_case` only feeds `pending_write` into
+  turn 2 when turn 1 returned a pending action, so the turn-2 "हाँ"/"नाही" checks fail as a
+  downstream consequence. The yes/no lexicon itself was verified working for those exact
+  inputs. **g-012 passing (a write case) does not fit this story cleanly — confirm with the
+  new per-case "Tools called" report section before acting on this diagnosis.**
+- **Batch conditions were not uniform, so the 63.2% has real error bars.** The run was split
+  into 3 `--offset` batches (host memory kills); batch 1 had the knowledge base connected,
+  batch 3 hit repeated network failures. The same early cases scored 60% with the DB down vs
+  88.9% with it up, so environment materially moves the number. Re-run end-to-end in one go on
+  a stable network before treating 63.2% as precise.
+- **Latent confirmation-gate bug (found 2026-09-23, NOT yet fixed):** `agent/loop.py::_normalize`
+  uses `re.sub(r"[^\w\s]", "", ...)`, and Python's `\w` excludes Unicode combining marks, so all
+  Devanagari vowel signs/anusvara are stripped — `हाँ` and `हो` both normalize to bare `ह`.
+  Exact lexicon entries still match (the lexicon is normalized the same way), but unrelated
+  single-word utterances can collapse onto a yes/no word — e.g. `हूँ` ("am") → `ह` → matches
+  **yes** and would execute a stored write. Whole-utterance matching limits the blast radius,
+  but this is golden-rule-4 territory. Fix: strip only Unicode punctuation/symbol categories
+  (P*/S*) instead of "everything that isn't `\w`", preserving marks (M*).
+- Earlier entry, now resolved by the run above: **M1 gate still not verified — next action is to run it, not more code.** The `openai_compat`
+  adapter (see decisions log 2026-09-22) is implemented and unit-tested, but nobody has pasted a
+  free Groq API key into `backend/.env` (`LLM_API_KEY`, plus `LLM_PROVIDER=openai_compat`,
+  `LLM_BASE_URL=https://api.groq.com/openai/v1`, `LLM_MODEL=openai/gpt-oss-20b` or similar — verify
+  current model ids/limits at console.groq.com/docs before picking one) and run
+  `uv run python -m voice_core.evals.run --pack farm_marketplace --suite text --llm openai_compat:<model>`.
+  Known trade-off: free open-weight models are expected to be weaker at Hindi/Marathi than Gemini,
+  so a low score here needs per-case inspection before concluding the *agent* is broken vs. the
+  *model* being a poor fit — swapping `LLM_MODEL`/`LLM_BASE_URL` to a different free or paid
+  provider requires no core code changes.
 - **The 31.6% gate run is not a reliable signal.** Gemini free-tier quota for `gemini-2.5-flash`
   is 20 requests/day per project; a 20-case golden suite easily needs 40-80+ requests (multi-turn
   cases, multi-round tool loops), so the quota was exhausted partway through and most later turns

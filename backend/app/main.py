@@ -6,11 +6,11 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from voice_core.adapters.embeddings_factory import build_embeddings
 from voice_core.adapters.fakes.auth import FakeAuthVerifier
 from voice_core.adapters.fakes.llm import FakeLLM
 from voice_core.config import Settings, get_settings
 from voice_core.packs.loader import load_pack
-from voice_core.ports.embeddings import EmbeddingProvider
 from voice_core.ports.knowledge import KnowledgeStore
 from voice_core.ports.llm import LLMProvider
 from voice_core.ports.types import Principal
@@ -24,24 +24,44 @@ _DEV_TOKEN = "dev-token"  # nosec B105 - dev-only bearer token, not a real crede
 _DEV_USER_REF = "dev-user"
 
 
+def _build_chain_provider(entry_provider: str, model: str, settings: Settings) -> LLMProvider:
+    if not model:
+        raise ValueError(f"LLM_FALLBACK_CHAIN entry {entry_provider!r} is missing a model")
+    if entry_provider == "gemini":
+        from voice_core.adapters.gemini.llm import GeminiLLM
+
+        return GeminiLLM(api_key=settings.gemini_api_key, model=model)
+    if entry_provider == "groq":
+        from voice_core.adapters.openai_compat.llm import OpenAICompatLLM
+
+        return OpenAICompatLLM(
+            api_key=settings.groq_api_key, model=model, base_url=settings.groq_base_url
+        )
+    raise ValueError(f"unknown provider {entry_provider!r} in LLM_FALLBACK_CHAIN")
+
+
 def _build_llm(settings: Settings) -> LLMProvider:
+    if settings.llm_fallback_chain:
+        from voice_core.adapters.fallback.llm import FallbackLLM
+
+        providers = []
+        for entry in settings.llm_fallback_chain.split(","):
+            entry_provider, _, model = entry.strip().partition(":")
+            providers.append((entry, _build_chain_provider(entry_provider, model, settings)))
+        return FallbackLLM(providers)
     if settings.llm_provider == "gemini":
         from voice_core.adapters.gemini.llm import GeminiLLM
 
         return GeminiLLM(api_key=settings.llm_api_key, model=settings.llm_model)
+    if settings.llm_provider == "openai_compat":
+        from voice_core.adapters.openai_compat.llm import OpenAICompatLLM
+
+        return OpenAICompatLLM(
+            api_key=settings.llm_api_key,
+            model=settings.llm_model,
+            base_url=settings.llm_base_url,
+        )
     return FakeLLM()
-
-
-def _build_embeddings(settings: Settings) -> EmbeddingProvider | None:
-    if settings.embedding_provider == "gemini":
-        from voice_core.adapters.gemini.embeddings import GeminiEmbedding
-
-        return GeminiEmbedding(api_key=settings.llm_api_key, dim=settings.embedding_dim)
-    if settings.embedding_provider == "fake":
-        from voice_core.adapters.fakes.embeddings import FakeEmbedding
-
-        return FakeEmbedding(dim=settings.embedding_dim)
-    return None
 
 
 def _build_knowledge_store(settings: Settings) -> KnowledgeStore | None:
@@ -71,7 +91,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     packs_root = (backend_dir / settings.domain_packs_dir).resolve()
 
     pack = load_pack(settings.domain_pack, packs_root)
-    embeddings = _build_embeddings(settings)
+    embeddings = build_embeddings(settings)
     knowledge_store = _build_knowledge_store(settings)
 
     app.state.pack = pack

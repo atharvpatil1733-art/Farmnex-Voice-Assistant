@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from voice_core.adapters.fakes.embeddings import FakeEmbedding
+from voice_core.adapters.embeddings_factory import build_embeddings
 from voice_core.adapters.fakes.llm import FakeLLM
 from voice_core.agent.loop import PendingWrite, TurnResult, run_text_turn
 from voice_core.config import Settings, get_settings
@@ -29,23 +30,54 @@ _SUITE_FILENAMES = {
 }
 
 
+def _build_chain_provider(entry_provider: str, model: str, settings: Settings) -> LLMProvider:
+    if not model:
+        raise ValueError(f"LLM_FALLBACK_CHAIN entry {entry_provider!r} is missing a model")
+    if entry_provider == "gemini":
+        from voice_core.adapters.gemini.llm import GeminiLLM
+
+        return GeminiLLM(api_key=settings.gemini_api_key, model=model)
+    if entry_provider == "groq":
+        from voice_core.adapters.openai_compat.llm import OpenAICompatLLM
+
+        return OpenAICompatLLM(
+            api_key=settings.groq_api_key, model=model, base_url=settings.groq_base_url
+        )
+    raise ValueError(f"unknown provider {entry_provider!r} in LLM_FALLBACK_CHAIN")
+
+
 def _resolve_llm(spec: str, settings: Settings) -> tuple[LLMProvider, str]:
     provider, _, model = spec.partition(":")
     if provider == "fake":
         return FakeLLM(), "mechanism-smoke-test"
+    if provider == "fallback":
+        from voice_core.adapters.fallback.llm import FallbackLLM
+
+        chain = model or settings.llm_fallback_chain
+        providers = []
+        for entry in chain.split(","):
+            entry_provider, _, entry_model = entry.strip().partition(":")
+            providers.append((entry, _build_chain_provider(entry_provider, entry_model, settings)))
+        return FallbackLLM(providers), "gate"
     if provider == "gemini":
         from voice_core.adapters.gemini.llm import GeminiLLM
 
         return GeminiLLM(api_key=settings.llm_api_key, model=model or settings.llm_model), "gate"
-    raise ValueError(f"unknown --llm spec: {spec!r} (use fake or gemini:<model>)")
+    if provider == "openai_compat":
+        from voice_core.adapters.openai_compat.llm import OpenAICompatLLM
 
-
-def _build_embeddings(settings: Settings) -> EmbeddingProvider:
-    if settings.embedding_provider == "gemini":
-        from voice_core.adapters.gemini.embeddings import GeminiEmbedding
-
-        return GeminiEmbedding(api_key=settings.llm_api_key, dim=settings.embedding_dim)
-    return FakeEmbedding(dim=settings.embedding_dim)
+        return (
+            OpenAICompatLLM(
+                api_key=settings.llm_api_key,
+                model=model or settings.llm_model,
+                base_url=settings.llm_base_url,
+            ),
+            "gate",
+        )
+    raise ValueError(
+        f"unknown --llm spec: {spec!r} "
+        "(use fake, gemini:<model>, openai_compat:<model>, or fallback[:<chain>])"
+    )
 
 
 def _build_knowledge_store(settings: Settings) -> KnowledgeStore | None:
@@ -158,6 +190,37 @@ def _render_report(
         failing = [c.key for c in all_checks if not c.passed]
         row = f"| {outcome.case_id} | {structural} | {content_label} | {', '.join(failing)} |"
         lines.append(row)
+
+    # Actual-vs-expected for every failing check, so a run is diagnosable without re-running
+    # it (re-runs cost provider quota and, on constrained hosts, get killed part-way).
+    failing_details = [
+        (o.case_id, c)
+        for o in outcomes
+        for c in o.structural_checks + o.content_checks
+        if not c.passed
+    ]
+    if failing_details:
+        lines.append("")
+        lines.append("## Failure details")
+        lines.append("")
+        for case_id, check in failing_details:
+            suffix = f" — {check.detail}" if check.detail else ""
+            lines.append(f"- **{case_id}** `{check.key}`{suffix}")
+        lines.append("")
+        lines.append("## Tools called per case")
+        lines.append("")
+        for outcome in outcomes:
+            called = [name for turn in outcome.turns for name in turn.tools_called]
+            lines.append(f"- **{outcome.case_id}**: {called or 'none'}")
+        lines.append("")
+        lines.append("## Final reply per case")
+        lines.append("")
+        for outcome in outcomes:
+            reply = outcome.turns[-1].reply_text if outcome.turns else ""
+            reply = " ".join(reply.split())
+            if len(reply) > 300:
+                reply = reply[:300] + "…"
+            lines.append(f"- **{outcome.case_id}**: {reply or '(empty)'}")
     return "\n".join(lines) + "\n"
 
 
@@ -231,7 +294,7 @@ async def _run_retrieval(args: argparse.Namespace, pack: LoadedPack, settings: S
     if knowledge_store is None:
         print("retrieval suite needs DATABASE_URL set (backend/.env)", file=sys.stderr)
         return 1
-    embeddings = _build_embeddings(settings)
+    embeddings = build_embeddings(settings)
 
     cases = _load_jsonl(pack.pack_dir / "evals" / _SUITE_FILENAMES["retrieval"])
     cases = cases[args.offset : args.offset + args.limit if args.limit else None]
@@ -264,11 +327,16 @@ async def _main_async(args: argparse.Namespace) -> int:
     if args.suite == "retrieval":
         return await _run_retrieval(args, pack, settings)
 
-    embeddings = _build_embeddings(settings)
+    embeddings = build_embeddings(settings)
     knowledge_store = _build_knowledge_store(settings)
     registry = ToolRegistry(pack, embeddings=embeddings, knowledge_store=knowledge_store)
 
-    llm_spec = args.llm or f"{settings.llm_provider}:{settings.llm_model}"
+    default_spec = (
+        "fallback"
+        if settings.llm_fallback_chain
+        else f"{settings.llm_provider}:{settings.llm_model}"
+    )
+    llm_spec = args.llm or default_spec
     llm, mode = _resolve_llm(llm_spec, settings)
 
     all_cases = _load_jsonl(pack.pack_dir / "evals" / _SUITE_FILENAMES[args.suite])
@@ -316,7 +384,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the voice assistant eval suite")
     parser.add_argument("--pack", required=True)
     parser.add_argument("--suite", choices=["text", "redteam", "retrieval"], default="text")
-    parser.add_argument("--llm", default=None, help="fake | gemini:<model>")
+    parser.add_argument(
+        "--llm",
+        default=None,
+        help="fake | gemini:<model> | openai_compat:<model> | fallback[:<chain>]",
+    )
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--offset", type=int, default=0, help="skip the first N cases")
     parser.add_argument("--limit", type=int, default=0, help="run at most N cases (0 = all)")
@@ -325,6 +397,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Show which fallback-chain provider answered each LLM call, so failures can be
+    # attributed to a model rather than guessed at.
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s provider=%(provider)s"))
+    fallback_logger = logging.getLogger("voice_core.adapters.fallback.llm")
+    fallback_logger.addHandler(handler)
+    fallback_logger.setLevel(logging.INFO)
     sys.exit(asyncio.run(_main_async(args)))
 
 

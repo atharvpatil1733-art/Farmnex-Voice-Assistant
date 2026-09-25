@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from voice_core.adapters.embeddings_factory import build_embeddings
 from voice_core.config import Settings, get_settings
 from voice_core.kb.chunker import DocParseError, build_chunks, parse_document
 from voice_core.packs.loader import load_pack
@@ -92,17 +93,6 @@ def _build_store(settings: Settings) -> KnowledgeStore:
     )
 
 
-def _build_embeddings(settings: Settings) -> EmbeddingProvider:
-    if settings.embedding_provider == "gemini":
-        from voice_core.adapters.gemini.embeddings import GeminiEmbedding
-
-        return GeminiEmbedding(api_key=settings.llm_api_key, dim=settings.embedding_dim)
-
-    from voice_core.adapters.fakes.embeddings import FakeEmbedding
-
-    return FakeEmbedding(dim=settings.embedding_dim)
-
-
 async def _main_async(args: argparse.Namespace) -> int:
     settings = get_settings()
     backend_dir = Path(__file__).resolve().parents[2]
@@ -118,7 +108,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         return 1
 
     store = _build_store(settings)
-    embeddings = _build_embeddings(settings)
+    embeddings = build_embeddings(settings)
 
     for path in paths:
         try:

@@ -143,3 +143,26 @@ async def test_search_knowledge_returns_real_chunks_when_wired(
     assert result.status == "ok"
     assert result.data is not None
     assert result.data["chunks"][0]["source"] == "pre-bidding-basics@v1"
+
+
+async def test_search_knowledge_tool_returns_error_result_on_store_failure(
+    pack, handler: MockToolHandler, ctx: ToolContext
+) -> None:
+    """A broken knowledge store must surface as a tool error the LLM can react to, not an
+    uncaught exception that crashes the whole turn/eval run."""
+    from voice_core.adapters.fakes.embeddings import FakeEmbedding
+
+    class _BrokenKnowledgeStore:
+        async def match(self, *args, **kwargs):
+            raise ConnectionError("simulated transient DB failure")
+
+    wired_registry = ToolRegistry(
+        pack, embeddings=FakeEmbedding(dim=4), knowledge_store=_BrokenKnowledgeStore()
+    )
+
+    result = await wired_registry.dispatch(
+        "search_knowledge", {"query": "how long is bidding open"}, ctx, handler
+    )
+
+    assert result.status == "error"
+    assert result.error_code == "KNOWLEDGE_STORE_UNAVAILABLE"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -8,7 +9,12 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from voice_core.agent.prompt import build_prompt, tool_result_to_message
-from voice_core.i18n.strings import CANCELLATION_ACK, LLM_FAILURE, TOOL_ROUND_CUTOFF
+from voice_core.i18n.strings import (
+    CANCELLATION_ACK,
+    CONFIRM_UNRESOLVED,
+    LLM_FAILURE,
+    TOOL_ROUND_CUTOFF,
+)
 from voice_core.i18n.strings import get as i18n_get
 from voice_core.packs.loader import LoadedPack
 from voice_core.ports.embeddings import EmbeddingProvider
@@ -61,15 +67,22 @@ _NO_WORDS = {
 
 
 def _normalize(text: str) -> str:
+    # Strip punctuation/symbols by Unicode category rather than `[^\w\s]`: Python's `\w`
+    # excludes combining marks, so the old form deleted every Devanagari vowel sign and
+    # anusvara — collapsing "हाँ"/"हो"/"हूँ" all onto bare "ह" and letting unrelated words
+    # match the yes/no lexicon (a write could execute without a real confirmation).
     text = unicodedata.normalize("NFC", text).strip().lower()
-    text = re.sub(r"[^\w\s]", "", text, flags=re.UNICODE)
+    text = "".join(ch for ch in text if not unicodedata.category(ch).startswith(("P", "S")))
     return re.sub(r"\s+", " ", text).strip()
 
 
 def _match_lexicon(text: str, extra: dict[str, list[str]]) -> Literal["yes", "no"] | None:
     normalized = _normalize(text)
-    yes_words = {_normalize(w) for w in (_YES_WORDS | set(extra.get("yes", [])))}
-    no_words = {_normalize(w) for w in (_NO_WORDS | set(extra.get("no", [])))}
+    if not normalized:
+        return None
+    # Drop entries that normalize to "" (e.g. an emoji-only pack word), so they can't match.
+    yes_words = {_normalize(w) for w in (_YES_WORDS | set(extra.get("yes", [])))} - {""}
+    no_words = {_normalize(w) for w in (_NO_WORDS | set(extra.get("no", [])))} - {""}
     if normalized in yes_words:
         return "yes"
     if normalized in no_words:
@@ -189,14 +202,22 @@ async def run_text_turn(
     if embeddings is not None and knowledge_store is not None:
         from voice_core.kb.retriever import auto_retrieve
 
-        knowledge_chunks = await auto_retrieve(
-            query=user_text,
-            pack_id=pack.id,
-            language=language,
-            embeddings=embeddings,
-            store=knowledge_store,
-            min_similarity=auto_rag_min_sim,
-        )
+        try:
+            knowledge_chunks = await auto_retrieve(
+                query=user_text,
+                pack_id=pack.id,
+                language=language,
+                embeddings=embeddings,
+                store=knowledge_store,
+                min_similarity=auto_rag_min_sim,
+            )
+        except Exception:
+            # Auto-retrieval is advisory (SPEC §6 step 4): the LLM can still call
+            # search_knowledge explicitly, so a transient backend failure here should
+            # degrade to "no extra knowledge this turn", not crash the whole turn.
+            logging.getLogger(__name__).warning(
+                "auto_retrieve failed; continuing without knowledge chunks", exc_info=True
+            )
     knowledge_used = [f"{c.doc_slug}" for c in knowledge_chunks]
 
     rendered = build_prompt(
@@ -264,7 +285,22 @@ async def run_text_turn(
             tool_results.append({"tool": write_call.name, "data": resolved_fields, "args": args})
 
             confirm_template = (pack_tool.confirm or {}).get(current_language, "")
-            summary = render_confirm_template(confirm_template, resolved_fields)
+            try:
+                summary = render_confirm_template(confirm_template, resolved_fields)
+            except ValueError as exc:
+                # The args matched no record, so the confirmation can't name what would
+                # change. Never propose a write the user can't verify — ask instead.
+                logging.getLogger(__name__).warning(
+                    "confirm_unresolved", extra={"tool": write_call.name, "error": str(exc)}
+                )
+                return _empty_result(
+                    i18n_get(CONFIRM_UNRESOLVED, current_language),
+                    current_language,
+                    rendered.prompt_hash,
+                    tools_called,
+                    tool_results,
+                    knowledge_used,
+                )
             return TurnResult(
                 reply_text=summary,
                 reply_language=current_language,

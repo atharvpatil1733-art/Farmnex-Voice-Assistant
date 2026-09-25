@@ -70,7 +70,7 @@
     additionalProperties: false
     required: [crop, quantity_kg, harvest_date]
     properties:
-      crop: {type: string}
+      crop: {type: string, enum: [onion, tomato, soybean, pomegranate], description: "Canonical crop id in English. Translate what the farmer says (प्याज़/कांदा → onion, टमाटर/टोमॅटो → tomato, सोयाबीन → soybean, अनार/डाळिंब → pomegranate)"}
       quantity_kg: {type: number, minimum: 1, maximum: 100000}
       harvest_date: {type: string, format: date}
       min_price_per_kg: {type: number, minimum: 0}
@@ -90,12 +90,15 @@
   description: >-
     Accept one specific bid on the user's listing. Use only after the user clearly chooses a bid
     (for example "the highest one"). Never use just to check bids.
+    If the user does not say which crop or listing, do not ask — use listing_ref "latest". The
+    confirmation question that follows states the crop, quantity and price, so the user can
+    correct you there.
   params:
     type: object
     additionalProperties: false
     required: [listing_ref, bid_ref]
     properties:
-      listing_ref: {type: string}
+      listing_ref: {type: string, description: "Listing id, or 'latest' for the listing currently accepting bids"}
       bid_ref: {type: string, description: "Bid id returned by get_bids_for_listing"}
   resolve_for_confirm: get_bids_for_listing
   confirm:
@@ -113,12 +116,14 @@
   description: >-
     Put an at-risk listing into Crop Rescue so nearby buyers get a fast, discounted offer before
     the produce spoils. Use when the user says produce is spoiling, won't last, or buyers backed out.
+    Needs a real listing_ref from get_my_listings: call get_my_listings first, and if the user
+    has more than one listing and did not say which crop, ask which one.
   params:
     type: object
     additionalProperties: false
     required: [listing_ref, days_left]
     properties:
-      listing_ref: {type: string}
+      listing_ref: {type: string, description: "Listing id returned by get_my_listings"}
       days_left: {type: integer, minimum: 0, maximum: 14, description: "Days before produce spoils, as the user estimates"}
   confirm:
     hi-IN: "आपके {crop} को क्रॉप रेस्क्यू में डालूँ? पास के खरीदारों को तुरंत सूचना जाएगी।"

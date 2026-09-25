@@ -117,6 +117,15 @@ class GeminiLLM:
             except httpx.TimeoutException as exc:
                 yield LLMError(code="timeout", message=str(exc), retryable=True)
                 return
+            except httpx.TransportError as exc:
+                # DNS/connection failures (httpx.ConnectError and friends) are NOT
+                # google.genai APIErrors, so without this they escape uncaught and deny the
+                # caller (e.g. FallbackLLM) any chance to try another provider.
+                if not emitted_any and attempt < _MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(_DEFAULT_RETRY_DELAY_S)
+                    continue
+                yield LLMError(code="unavailable", message=str(exc), retryable=True)
+                return
             except ClientError as exc:
                 is_rate_limited = exc.code == 429
                 # A request that already emitted content must not be retried (SPEC: never retry

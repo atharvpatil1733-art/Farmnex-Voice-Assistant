@@ -75,15 +75,75 @@ class CaseOutcome:
         return self.structural_passed and all(c.passed for c in self.content_checks)
 
 
+def _collect_fields(node: Any, values: dict[str, list[Any]]) -> None:
+    # Recurse so fields nested in lists (e.g. each item of a `bids` array) are found too.
+    if isinstance(node, dict):
+        for k, v in node.items():
+            values.setdefault(k, []).append(v)
+            _collect_fields(v, values)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_fields(item, values)
+
+
 def _tool_field_values(turns: list[TurnResult]) -> dict[str, list[Any]]:
     values: dict[str, list[Any]] = {}
     for turn in turns:
         for entry in turn.tool_results:
-            data = entry.get("data") or {}
-            if isinstance(data, dict):
-                for k, v in data.items():
-                    values.setdefault(k, []).append(v)
+            _collect_fields(entry.get("data") or {}, values)
     return values
+
+
+# Devanagari digits (U+0966..U+096F) → ASCII, so "२७" in a Hindi/Marathi reply matches 27.
+_DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+
+
+# Month names as a spoken reply would say them (en / hi / mr), indexed 1-12.
+_MONTH_NAMES: dict[int, tuple[str, ...]] = {
+    1: ("january", "जनवरी", "जानेवारी"),
+    2: ("february", "फ़रवरी", "फरवरी", "फेब्रुवारी"),
+    3: ("march", "मार्च"),
+    4: ("april", "अप्रैल", "एप्रिल"),
+    5: ("may", "मई", "मे"),
+    6: ("june", "जून"),
+    7: ("july", "जुलाई", "जुलै"),
+    8: ("august", "अगस्त", "ऑगस्ट"),
+    9: ("september", "सितंबर", "सितम्बर", "सप्टेंबर"),
+    10: ("october", "अक्टूबर", "ऑक्टोबर"),
+    11: ("november", "नवंबर", "नवम्बर", "नोव्हेंबर"),
+    12: ("december", "दिसंबर", "दिसम्बर", "डिसेंबर"),
+}
+_ISO_DATE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+
+
+def _mentions_spoken_date(iso: str, text: str) -> bool:
+    """An ISO date counts as mentioned if the reply says its day number and month name,
+    since spoken output should say "18 September", never "2026-09-18"."""
+    match = _ISO_DATE.match(iso)
+    if not match:
+        return False
+    month, day = int(match.group(2)), int(match.group(3))
+    has_day = re.search(rf"(?<!\d){day}(?!\d)", text) is not None
+    tokens = re.findall(r"[^\s\d.,!?।]+", text.lower())
+    # Long names may carry a case suffix ("सप्टेंबरला"); short ones ("मे", "may") must stand
+    # alone, or "में" / "you may" would count as the month of May.
+    has_month = any(
+        tok == name or (len(name) > 3 and tok.startswith(name))
+        for tok in tokens
+        for name in _MONTH_NAMES[month]
+    )
+    return has_day and has_month
+
+
+def _mentions(value: Any, reply_text: str) -> bool:
+    if isinstance(value, dict | list):
+        return False
+    text = reply_text.translate(_DEVANAGARI_DIGITS)
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        # Digit boundaries, so 27 isn't "mentioned" by 270; 27.0 is spoken as 27.
+        number = f"{value:g}"
+        return re.search(rf"(?<![\d.]){re.escape(number)}(?![\d]|\.\d)", text) is not None
+    return str(value) in text or _mentions_spoken_date(str(value), text)
 
 
 def _tool_arg_keys(turns: list[TurnResult]) -> set[str]:
@@ -127,7 +187,11 @@ def evaluate_case(
         )
 
     if "pending_action" in expect:
-        structural("pending_action", last.pending_action == expect["pending_action"])
+        structural(
+            "pending_action",
+            last.pending_action == expect["pending_action"],
+            f"expected {expect['pending_action']!r}, got {last.pending_action!r}",
+        )
 
     if "args_subset" in expect:
         actual_args = last.pending_write_args or {}
@@ -136,16 +200,32 @@ def evaluate_case(
         structural("args_subset", ok, f"expected {expected_args} in {actual_args}")
 
     if "executed" in expect:
-        structural("executed", last.executed == expect["executed"])
+        structural(
+            "executed",
+            last.executed == expect["executed"],
+            f"expected {expect['executed']!r}, got {last.executed!r}",
+        )
 
     if "executed_tool" in expect:
-        structural("executed_tool", last.executed_tool == expect["executed_tool"])
+        structural(
+            "executed_tool",
+            last.executed_tool == expect["executed_tool"],
+            f"expected {expect['executed_tool']!r}, got {last.executed_tool!r}",
+        )
 
     if "confirmed_via" in expect:
-        structural("confirmed_via", last.confirmed_via == expect["confirmed_via"])
+        structural(
+            "confirmed_via",
+            last.confirmed_via == expect["confirmed_via"],
+            f"expected {expect['confirmed_via']!r}, got {last.confirmed_via!r}",
+        )
 
     if "pending_status" in expect:
-        structural("pending_status", last.pending_status == expect["pending_status"])
+        structural(
+            "pending_status",
+            last.pending_status == expect["pending_status"],
+            f"expected {expect['pending_status']!r}, got {last.pending_status!r}",
+        )
 
     if "reply_language" in expect:
         ok = (
@@ -167,7 +247,7 @@ def evaluate_case(
         ok = True
         for field_name in expect["must_mention_from_tool"]:
             values = field_values.get(field_name, [])
-            if not any(str(v) in last.reply_text for v in values):
+            if not any(_mentions(v, last.reply_text) for v in values):
                 ok = False
         content("must_mention_from_tool", ok)
 
