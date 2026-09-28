@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 
 from voice_core.ports.llm import LLMProvider
 from voice_core.ports.types import (
@@ -16,6 +17,19 @@ from voice_core.ports.types import (
 
 logger = logging.getLogger(__name__)
 
+# Circuit breaker: after a 429 a link is skipped for a while instead of being retried on every
+# LLM round (each retry cost 0.2-0.5 s of dead air). Free tiers limit per minute and per day.
+RATE_LIMIT_COOLDOWN_S = 60.0
+DAILY_QUOTA_COOLDOWN_S = 3600.0
+_DAILY_MARKERS = ("perday", "per day", "daily")
+
+
+def _cooldown_for(error: LLMError) -> float:
+    compact = error.message.lower()
+    if any(marker in compact or marker in compact.replace(" ", "") for marker in _DAILY_MARKERS):
+        return DAILY_QUOTA_COOLDOWN_S
+    return RATE_LIMIT_COOLDOWN_S
+
 
 class FallbackLLM:
     """Tries a list of LLMProviders in priority order. Only advances to the next one if the
@@ -25,10 +39,41 @@ class FallbackLLM:
 
     name = "fallback"
 
-    def __init__(self, providers: list[tuple[str, LLMProvider]]) -> None:
+    def __init__(
+        self,
+        providers: list[tuple[str, LLMProvider]],
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         if not providers:
             raise ValueError("FallbackLLM needs at least one provider")
         self._providers = providers
+        self._clock = clock
+        self._cooling_until: dict[str, float] = {}
+
+    async def warm(self) -> None:
+        """Warm every link that supports it; best-effort, failures are ignored."""
+        for _, provider in self._providers:
+            warm = getattr(provider, "warm", None)
+            if warm is not None:
+                try:
+                    await warm()
+                except Exception:
+                    logger.info("llm_warm_failed", exc_info=True)
+
+    def _order(self) -> list[tuple[str, LLMProvider]]:
+        """Healthy links in priority order; if every link is cooling, only the one that
+        recovers first (so a turn still gets one real attempt)."""
+        now = self._clock()
+        healthy = [
+            (label, provider)
+            for label, provider in self._providers
+            if self._cooling_until.get(label, 0.0) <= now
+        ]
+        if healthy:
+            return healthy
+        soonest = min(self._providers, key=lambda lp: self._cooling_until.get(lp[0], 0.0))
+        return [soonest]
 
     async def stream(
         self,
@@ -40,9 +85,10 @@ class FallbackLLM:
         timeout_s: float,
     ) -> AsyncIterator[LLMEvent]:
         last_error: LLMError | None = None
-        for index, (label, provider) in enumerate(self._providers):
+        order = self._order()
+        for index, (label, provider) in enumerate(order):
             emitted = False
-            is_last = index == len(self._providers) - 1
+            is_last = index == len(order) - 1
             failure: LLMError | None = None
 
             try:
@@ -90,6 +136,10 @@ class FallbackLLM:
                 logger.warning(
                     "llm_provider_failed", extra={"provider": label, "code": failure.code}
                 )
+                if failure.code == "rate_limited":
+                    cooldown = _cooldown_for(failure)
+                    self._cooling_until[label] = self._clock() + cooldown
+                    logger.info("llm_link_cooling", extra={"provider": label, "seconds": cooldown})
                 if emitted or is_last:
                     yield failure
                     return

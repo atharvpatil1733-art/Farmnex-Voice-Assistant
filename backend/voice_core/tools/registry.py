@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from voice_core.packs.loader import LoadedPack
@@ -10,6 +11,7 @@ from voice_core.ports.embeddings import EmbeddingProvider
 from voice_core.ports.host import HostToolHandler
 from voice_core.ports.knowledge import KnowledgeStore
 from voice_core.ports.types import ToolContext, ToolDef, ToolResult, ToolSpec
+from voice_core.tools.answer_template import render_answer
 from voice_core.tools.schema import assert_no_identity_fields, validate_args
 
 CoreHandler = Callable[[dict[str, Any], ToolContext], Awaitable[ToolResult]]
@@ -36,6 +38,10 @@ class PackTool:
     confirm: dict[str, str] | None = None
     success_message: dict[str, str] | None = None
     resolve_for_confirm: str | None = None
+    # Fixed-phrase answer per language, used instead of a 2nd LLM round (voice latency).
+    answer_template: dict[str, str] | None = None
+    # field -> allowed values list, or {from: today} / {after: now} for date(time) fields
+    answer_when: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +93,25 @@ class ConfirmResolution:
     fields: dict[str, Any]
     pinned_args: dict[str, Any]
     ambiguous: bool = False  # several records matched: the confirmation can't name just one
+
+
+def _guard_ok(value: Any, rule: Any, now: datetime) -> bool:
+    """answer_when check. Stale dates must never be spoken as future facts."""
+    if isinstance(rule, list | tuple):
+        return value in rule
+    if not isinstance(rule, dict) or not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    if rule.get("from") == "today":
+        local = parsed.astimezone(now.tzinfo) if parsed.tzinfo else parsed
+        return local.date() >= now.date()
+    if rule.get("after") == "now":
+        moment = parsed if parsed.tzinfo else parsed.replace(tzinfo=now.tzinfo)
+        return moment > now
+    return False
 
 
 def render_confirm_template(template: str, fields: dict[str, Any]) -> str:
@@ -160,6 +185,10 @@ class ToolRegistry:
                     dict(raw["success_message"]) if "success_message" in raw else None
                 ),
                 resolve_for_confirm=raw.get("resolve_for_confirm"),
+                answer_template=(
+                    dict(raw["answer_template"]) if "answer_template" in raw else None
+                ),
+                answer_when=(dict(raw["answer_when"]) if "answer_when" in raw else None),
             )
 
     def tool_specs(self) -> list[ToolSpec]:
@@ -215,6 +244,28 @@ class ToolRegistry:
                 client_actions=result.client_actions,
             )
         return result
+
+    def fixed_answer(
+        self,
+        name: str,
+        data: dict[str, Any] | None,
+        language: str,
+        labels: dict[str, dict[str, str]],
+        *,
+        now: datetime,
+    ) -> str | None:
+        """The pack's fixed sentence for this read result, or None to let the LLM answer
+        (no template for the language, a guard doesn't match, or a value is missing)."""
+        tool = self._pack_tools.get(name)
+        if tool is None or tool.tool_def.kind != "read" or not isinstance(data, dict):
+            return None
+        template = (tool.answer_template or {}).get(language)
+        if not template:
+            return None
+        for key, rule in (tool.answer_when or {}).items():
+            if not _guard_ok(data.get(key), rule, now):
+                return None
+        return render_answer(template, data, labels)
 
     def validate(self, name: str, args: dict[str, Any]) -> list[str]:
         tool = self._core_tools.get(name) or self._pack_tools[name]

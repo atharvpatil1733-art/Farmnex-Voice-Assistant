@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 from voice_core.agent.loop import TurnResult
+from voice_core.speech.locale import get_locale
 
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 _MARATHI_STOPWORDS = {"आहे", "आहेत", "तुम्ही", "मला", "काय", "आणि", "करा", "केली", "बघते"}
@@ -107,6 +109,8 @@ _DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789
 
 
 # Month names as a spoken reply would say them (en / hi / mr), indexed 1-12.
+
+_LANGS = ("hi-IN", "mr-IN", "en-IN")
 _MONTH_NAMES: dict[int, tuple[str, ...]] = {
     1: ("january", "जनवरी", "जानेवारी"),
     2: ("february", "फ़रवरी", "फरवरी", "फेब्रुवारी"),
@@ -124,12 +128,29 @@ _MONTH_NAMES: dict[int, tuple[str, ...]] = {
 _ISO_DATE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
 
+def _mentions_relative_day(iso: str, text: str) -> bool:
+    """Dates within a day of today are spoken as "आज/कल/उद्या/today/tomorrow/yesterday"."""
+    try:
+        delta = (date.fromisoformat(iso) - date.today()).days
+    except ValueError:
+        return False
+    words = {
+        0: [get_locale(lang).today for lang in _LANGS],
+        1: [get_locale(lang).tomorrow for lang in _LANGS],
+        -1: [get_locale(lang).yesterday for lang in _LANGS],
+    }.get(delta, [])
+    tokens = set(re.findall(r"[^\s\d.,!?।]+", text.lower()))
+    return any(word.lower() in tokens for word in words)
+
+
 def _mentions_spoken_date(iso: str, text: str) -> bool:
     """An ISO date counts as mentioned if the reply says its day number and month name,
     since spoken output should say "18 September", never "2026-09-18"."""
     match = _ISO_DATE.match(iso)
     if not match:
         return False
+    if _mentions_relative_day(iso, text):
+        return True
     month, day = int(match.group(2)), int(match.group(3))
     has_day = re.search(rf"(?<!\d){day}(?!\d)", text) is not None
     tokens = re.findall(r"[^\s\d.,!?।]+", text.lower())

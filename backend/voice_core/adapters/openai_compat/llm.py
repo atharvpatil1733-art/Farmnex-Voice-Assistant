@@ -100,6 +100,10 @@ class OpenAICompatLLM:
         )
         self._model = model
 
+    async def warm(self) -> None:
+        """Open the connection before the first turn (the models endpoint costs no tokens)."""
+        await self._client.models.list()
+
     async def stream(
         self,
         messages: list[ChatMessage],

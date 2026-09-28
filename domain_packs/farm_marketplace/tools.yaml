@@ -27,6 +27,12 @@
   result_fields: [listing_ref, crop, quantity_kg, bidding_ends_at, bids]
   result_hint: "Speak the highest bid first and at most two bids. Mention when bidding ends."
   display_hint: {hi-IN: "बोलियाँ देख रही हूँ", mr-IN: "बोली तपासते", en-IN: "Checking bids"}
+  # Early fixed-phrase answer (voice): spoken while the LLM continues. Unresolvable → LLM only.
+  answer_when: {bidding_ends_at: {after: now}}   # closed bidding: let the LLM explain
+  answer_template:
+    hi-IN: "आपके {quantity_kg} किलो {crop|crops} पर {count(bids)} बोलियाँ आई हैं। सबसे ऊँची बोली {max(bids.price_per_kg)} रुपये किलो है।"
+    mr-IN: "तुमच्या {quantity_kg} किलो {crop|crops} ला {count(bids)} बोली आल्या आहेत. सर्वात जास्त बोली {max(bids.price_per_kg)} रुपये किलो आहे."
+    en-IN: "Your {quantity_kg} kilos of {crop|crops} have {count(bids)} bids. The highest is {max(bids.price_per_kg)} rupees per kilo."
 
 - name: get_order_status
   kind: read
@@ -35,6 +41,11 @@
   handler: {type: mock, fixture: fixtures/orders.json}
   result_fields: [order_ref, crop, quantity_kg, price_per_kg, status, payment_status, payment_expected_on]
   display_hint: {hi-IN: "ऑर्डर देख रही हूँ", mr-IN: "ऑर्डर बघते", en-IN: "Checking your order"}
+  answer_when: {payment_status: [processing, pending], payment_expected_on: {from: today}}
+  answer_template:
+    hi-IN: "आपके {crop|crops} का पेमेंट {payment_status|payment}। अपेक्षित तारीख {payment_expected_on} है।"
+    mr-IN: "तुमच्या {crop|crops} चे पेमेंट {payment_status|payment}. अपेक्षित तारीख {payment_expected_on} आहे."
+    en-IN: "Payment for your {crop|crops} {payment_status|payment}. The expected date is {payment_expected_on}."
 
 - name: get_pickup_status
   kind: read
@@ -43,6 +54,11 @@
   handler: {type: mock, fixture: fixtures/pickups.json}
   result_fields: [order_ref, status, pickup_date, window_start, window_end, driver_first_name, is_return_trip]
   display_hint: {hi-IN: "पिकअप की जानकारी देख रही हूँ", mr-IN: "पिकअपची माहिती बघते", en-IN: "Checking pickup"}
+  answer_when: {status: [scheduled], pickup_date: {from: today}}
+  answer_template:
+    hi-IN: "आपका माल {pickup_date}, {window_start} से {window_end} के बीच उठेगा। ड्राइवर {driver_first_name|name} आएँगे।"
+    mr-IN: "तुमचा माल {pickup_date}, {window_start} ते {window_end} या वेळेत नेला जाईल. ड्रायव्हर {driver_first_name|name} येतील."
+    en-IN: "Pickup date: {pickup_date}, between {window_start} and {window_end}. Your driver is {driver_first_name|name}."
 
 - name: get_demand_forecast
   kind: read

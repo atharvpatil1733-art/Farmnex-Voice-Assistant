@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,8 @@ class LoadedPack:
     speech_units: tuple[SpokenUnit, ...] = ()
     tts_speaker: str | None = None
     speech_pace: float = 1.0
+    # label set -> language -> {raw value: spoken word}, for tools' answer_template
+    answer_labels: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
 
 
 def _load_yaml(pack_id: str, path: Path) -> Any:
@@ -113,4 +115,11 @@ def load_pack(pack_id: str, packs_root: Path) -> LoadedPack:
         speech_units=speech_units,
         tts_speaker=tts_speaker,
         speech_pace=float(voice.get("speech_pace", 1.0)),
+        answer_labels={
+            str(name): {
+                str(lang): {str(k): str(v) for k, v in (words or {}).items()}
+                for lang, words in (by_lang or {}).items()
+            }
+            for name, by_lang in (config.get("answer_labels") or {}).items()
+        },
     )

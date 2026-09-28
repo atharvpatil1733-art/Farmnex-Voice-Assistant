@@ -8,8 +8,9 @@ import time
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from voice_core.agent.confirmation import ConfirmationGate
 from voice_core.agent.prompt import build_prompt, tool_result_to_message, wrap_tool_result
@@ -43,6 +44,7 @@ from voice_core.ports.types import (
     ToolInvocation,
     ToolResult,
 )
+from voice_core.speech.normalize import normalize_for_speech
 from voice_core.tools.registry import ToolRegistry, render_confirm_template
 
 MAX_TOOL_ROUNDS = 4
@@ -105,9 +107,16 @@ def _match_lexicon(text: str, extra: dict[str, list[str]]) -> Literal["yes", "no
 
 PendingOutcome = Literal["pending", "cancelled", "expired", "executed_ok", "executed_error"]
 # Called around each read-tool call, e.g. to show "checking…" or play a filler (SPEC §6 step 5).
+# Voice only: receives a pack fixed-phrase answer to speak *now*, while the LLM keeps going.
+InterimAnswerHook = Callable[[str], Awaitable[None]]
 ToolActivityHook = Callable[[str, Literal["started", "finished"]], Awaitable[None]]
 
 logger = logging.getLogger(__name__)
+
+# A stalled DB must not wedge a barge-in: wait this long for read-audit rows, then let them
+# finish in the background (strong refs here so they're never garbage-collected).
+AUDIT_WAIT_S = 2.0
+_BACKGROUND: set[asyncio.Future[Any]] = set()
 
 
 @dataclass(frozen=True)
@@ -125,6 +134,9 @@ class TurnResult:
     pending_status: PendingOutcome | None
     prompt_hash: str
     pending_action_id: str | None = None
+    # Voice only: a fixed-phrase answer already spoken mid-turn. reply_text then holds only
+    # what the LLM added after it ("" if nothing), never a repeat of the early answer.
+    early_answer: str | None = None
 
 
 def _empty_result(
@@ -153,6 +165,12 @@ def _empty_result(
     )
 
 
+def _knowledge_sources(data: dict[str, Any] | None) -> list[str]:
+    """Doc slugs from a search_knowledge result ("slug@v2" -> "slug")."""
+    chunks = (data or {}).get("chunks") or []
+    return [str(c.get("source", "")).split("@")[0] for c in chunks if isinstance(c, dict)]
+
+
 def _parse_args(call: ToolCall) -> dict[str, Any] | None:
     try:
         args = json.loads(call.args_json or "{}")
@@ -175,6 +193,7 @@ async def _dispatch_audited(
     name: str,
     args: dict[str, Any],
     pending_action_id: str | None = None,
+    audit_tasks: list[asyncio.Task[None]] | None = None,
 ) -> ToolResult:
     """Run a tool and write its audit row. A handler exception becomes an error result (the
     user hears a localized failure), never a crash and never a success."""
@@ -185,23 +204,41 @@ async def _dispatch_audited(
         logger.warning("tool_dispatch_failed", extra={"tool": name}, exc_info=True)
         result = ToolResult(status="error", error_code="HANDLER_EXCEPTION")
     if registry.has_pack_tool(name):
-        try:
-            await store.record_invocation(
-                ToolInvocation(
-                    user_ref=ctx.user_ref,
-                    tool_name=name,
-                    kind=registry.get(name).tool_def.kind,
-                    args=args,
-                    status=result.status,
-                    conversation_id=conversation_id,
-                    pending_action_id=pending_action_id,
-                    error_code=result.error_code,
-                    duration_ms=int((time.perf_counter() - started) * 1000),
-                )
-            )
-        except Exception:
-            logger.error("audit_write_failed", extra={"tool": name}, exc_info=True)
+        kind = registry.get(name).tool_def.kind
+        invocation = ToolInvocation(
+            user_ref=ctx.user_ref,
+            tool_name=name,
+            kind=kind,
+            args=args,
+            status=result.status,
+            conversation_id=conversation_id,
+            pending_action_id=pending_action_id,
+            error_code=result.error_code,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        if kind == "read" and audit_tasks is not None:
+            # A remote DB round trip (~0.5 s) must not delay the answer: the caller awaits these
+            # before the turn ends, so the row is still always written. Writes stay synchronous.
+            audit_tasks.append(asyncio.create_task(_record(store, invocation)))
+        else:
+            await _record(store, invocation)
     return result
+
+
+def _defer(pending: asyncio.Future[Any]) -> None:
+    _BACKGROUND.add(pending)
+    pending.add_done_callback(_BACKGROUND.discard)
+    logger.warning("audit_write_deferred")
+
+
+AUDIT_WRITE_TIMEOUT_S = 10.0  # so a hung DB can't grow _BACKGROUND forever
+
+
+async def _record(store: ConversationStore, invocation: ToolInvocation) -> None:
+    try:
+        await asyncio.wait_for(store.record_invocation(invocation), AUDIT_WRITE_TIMEOUT_S)
+    except Exception:
+        logger.error("audit_write_failed", extra={"tool": invocation.tool_name}, exc_info=True)
 
 
 def _pending_context(action: PendingAction) -> ChatMessage:
@@ -301,12 +338,14 @@ async def run_text_turn(
     user_text: str,
     embeddings: EmbeddingProvider | None = None,
     knowledge_store: KnowledgeStore | None = None,
-    auto_rag_min_sim: float = 0.45,
+    auto_rag_min_sim: float | None = 0.45,
     llm_temperature: float = 0.2,
     llm_max_tokens: int = 800,
     llm_timeout_s: float = 20.0,
     clock: Callable[[], datetime] | None = None,
     on_tool: ToolActivityHook | None = None,
+    today: date | None = None,  # for speaking dates; default: now in the pack's timezone
+    on_interim_answer: InterimAnswerHook | None = None,
 ) -> TurnResult:
     gate = ConfirmationGate(store, clock=clock) if clock else ConfirmationGate(store)
     pending, just_expired = await gate.current(conversation_id)
@@ -356,6 +395,8 @@ async def run_text_turn(
         llm_max_tokens=llm_max_tokens,
         llm_timeout_s=llm_timeout_s,
         on_tool=on_tool,
+        today=today,
+        on_interim_answer=on_interim_answer,
     )
 
     # A pending action survives only while its confirmation question is the last thing the
@@ -382,14 +423,81 @@ async def _run_llm_rounds(
     user_text: str,
     embeddings: EmbeddingProvider | None,
     knowledge_store: KnowledgeStore | None,
-    auto_rag_min_sim: float,
+    auto_rag_min_sim: float | None,
     llm_temperature: float,
     llm_max_tokens: int,
     llm_timeout_s: float,
     on_tool: ToolActivityHook | None = None,
+    today: date | None = None,
+    on_interim_answer: InterimAnswerHook | None = None,
+) -> TurnResult:
+    """Run the LLM rounds. Deferred read-audit writes are awaited before returning (bounded,
+    and shielded so a second cancel can't drop them); stragglers keep running in the
+    background with a strong reference instead of being lost."""
+    audit_tasks: list[asyncio.Task[None]] = []
+    try:
+        return await _run_llm_rounds_inner(
+            pack=pack,
+            registry=registry,
+            handler=handler,
+            llm=llm,
+            store=store,
+            gate=gate,
+            conversation_id=conversation_id,
+            ctx=ctx,
+            language=language,
+            history=history,
+            user_text=user_text,
+            embeddings=embeddings,
+            knowledge_store=knowledge_store,
+            auto_rag_min_sim=auto_rag_min_sim,
+            llm_temperature=llm_temperature,
+            llm_max_tokens=llm_max_tokens,
+            llm_timeout_s=llm_timeout_s,
+            on_tool=on_tool,
+            today=today,
+            on_interim_answer=on_interim_answer,
+            audit_tasks=audit_tasks,
+        )
+    finally:
+        if audit_tasks:
+            pending = asyncio.gather(*audit_tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(asyncio.shield(pending), timeout=AUDIT_WAIT_S)
+            except TimeoutError:
+                _defer(pending)  # the turn's result stands; rows land when the DB recovers
+            except asyncio.CancelledError:
+                _defer(pending)
+                raise
+
+
+async def _run_llm_rounds_inner(
+    *,
+    pack: LoadedPack,
+    registry: ToolRegistry,
+    handler: HostToolHandler,
+    llm: LLMProvider,
+    store: ConversationStore,
+    gate: ConfirmationGate,
+    conversation_id: str,
+    ctx: ToolContext,
+    language: str,
+    history: list[ChatMessage],
+    user_text: str,
+    embeddings: EmbeddingProvider | None,
+    knowledge_store: KnowledgeStore | None,
+    auto_rag_min_sim: float | None,
+    llm_temperature: float,
+    llm_max_tokens: int,
+    llm_timeout_s: float,
+    on_tool: ToolActivityHook | None = None,
+    today: date | None = None,
+    on_interim_answer: InterimAnswerHook | None = None,
+    audit_tasks: list[asyncio.Task[None]],
 ) -> TurnResult:
     knowledge_chunks: list[Chunk] = []
-    if embeddings is not None and knowledge_store is not None:
+    # auto_rag_min_sim=None: no per-turn lookup; the LLM calls search_knowledge when needed.
+    if embeddings is not None and knowledge_store is not None and auto_rag_min_sim is not None:
         from voice_core.kb.retriever import auto_retrieve
 
         try:
@@ -418,8 +526,10 @@ async def _run_llm_rounds(
     tool_results: list[dict[str, Any]] = []
     current_language = language
 
-    def done(reply: str, **kwargs: Any) -> TurnResult:
-        return _empty_result(
+    interim_answer: str | None = None
+
+    def done(reply: str, *, from_llm: bool = True, **kwargs: Any) -> TurnResult:
+        result = _empty_result(
             reply,
             current_language,
             rendered.prompt_hash,
@@ -428,6 +538,14 @@ async def _run_llm_rounds(
             knowledge_used,
             **kwargs,
         )
+        if interim_answer is not None:
+            # The user already heard the fixed-phrase answer: keep only what the LLM added (a
+            # late failure/cutoff message adds nothing). Write proposals don't come here.
+            # A late failure/cutoff phrase is kept: the user must hear that the rest (e.g. an
+            # action they asked for) didn't happen. It never claims success.
+            follow_up = reply.strip()
+            return replace(result, reply_text=follow_up, early_answer=interim_answer)
+        return result
 
     for _round in range(MAX_TOOL_ROUNDS):
         text_buffer = ""
@@ -452,7 +570,7 @@ async def _run_llm_rounds(
                     pass
 
         if had_error and not text_buffer and not tool_calls:
-            return done(i18n_get(LLM_FAILURE, current_language))
+            return done(i18n_get(LLM_FAILURE, current_language), from_llm=False)
 
         if not tool_calls:
             return done(text_buffer.strip())
@@ -477,9 +595,13 @@ async def _run_llm_rounds(
                 messages.append(proposal)
                 continue
             return replace(
-                proposal, prompt_hash=rendered.prompt_hash, knowledge_used=knowledge_used
+                proposal,
+                prompt_hash=rendered.prompt_hash,
+                knowledge_used=knowledge_used,
+                early_answer=interim_answer,  # already heard; the confirm question follows it
             )
 
+        last_read: tuple[str, ToolResult] | None = None
         for call in tool_calls:
             parsed = _parse_args(call)
             tools_called.append(call.name)
@@ -499,11 +621,16 @@ async def _run_llm_rounds(
                         conversation_id=conversation_id,
                         name=call.name,
                         args=args,
+                        audit_tasks=audit_tasks,
                     )
                 finally:
                     if on_tool is not None:
                         await on_tool(call.name, "finished")
             tool_results.append({"tool": call.name, "data": result.data, "args": args})
+            if call.name == "search_knowledge" and result.status == "ok":
+                knowledge_used = list(
+                    dict.fromkeys([*knowledge_used, *_knowledge_sources(result.data)])
+                )
 
             if call.name == "set_preferred_language" and result.status == "ok":
                 current_language = args["language"]
@@ -512,8 +639,53 @@ async def _run_llm_rounds(
                 return done(text_buffer.strip())
 
             messages.append(tool_result_to_message(call.name, result))
+            last_read = (call.name, result)
 
-    return done(i18n_get(TOOL_ROUND_CUTOFF, current_language))
+        # Early fixed-phrase answer (voice): one read tool with a pack template is spoken right
+        # away (~1 s sooner), while the LLM continues — the user may have asked for an action
+        # (a write that needs the next round). Unresolved -> nothing spoken.
+        if (
+            on_interim_answer is not None
+            and interim_answer is None
+            and len(tool_calls) == 1
+            and last_read is not None
+            and last_read[1].status == "ok"
+        ):
+            labels = {
+                name: by_lang.get(current_language, {})
+                for name, by_lang in pack.answer_labels.items()
+            }
+            answer = registry.fixed_answer(
+                last_read[0],
+                last_read[1].data,
+                current_language,
+                labels,
+                now=datetime.now(ZoneInfo(pack.timezone)),
+            )
+            if answer:
+                spoken_today = today or datetime.now(ZoneInfo(pack.timezone)).date()
+                interim_answer = normalize_for_speech(
+                    answer, current_language, today=spoken_today, units=pack.speech_units
+                )
+                await on_interim_answer(interim_answer)
+                # Let the LLM add only what is missing (another item, a date, a clarifying
+                # question) instead of re-saying it. A user-role note with no tool text: host
+                # data never gets system trust, and no adapter sends a trailing model turn.
+                messages.append(ChatMessage(role="assistant", content=interim_answer))
+                messages.append(
+                    ChatMessage(
+                        role="user",
+                        content=(
+                            "(Note from the app, not from me: your previous message was "
+                            "already spoken to me. Do not repeat it. If nothing important is "
+                            "missing, reply with an empty message. Otherwise say only what is "
+                            "missing, in one short sentence, or call a tool if my request needs "
+                            "an action.)"
+                        ),
+                    )
+                )
+
+    return done(i18n_get(TOOL_ROUND_CUTOFF, current_language), from_llm=False)
 
 
 async def _propose_write(

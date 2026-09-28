@@ -55,3 +55,13 @@ speech_units:                  # how the voice reads units (core normalizer appl
     hi-IN: टन
     mr-IN: टन
     en-IN: [tonne, tonnes]
+
+answer_labels:                 # value -> spoken word, used by tools.yaml answer_template {x|set}
+  crops:
+    hi-IN: {onion: प्याज़, tomato: टमाटर, soybean: सोयाबीन, pomegranate: अनार}
+    mr-IN: {onion: कांदा, tomato: टोमॅटो, soybean: सोयाबीन, pomegranate: डाळिंब}
+    en-IN: {onion: onions, tomato: tomatoes, soybean: soybean, pomegranate: pomegranates}
+  payment:
+    hi-IN: {processing: अभी प्रक्रिया में है, pending: अभी बाकी है}
+    mr-IN: {processing: प्रक्रियेत आहे, pending: अजून बाकी आहे}
+    en-IN: {processing: is being processed, pending: is still pending}

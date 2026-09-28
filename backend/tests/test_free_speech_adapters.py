@@ -150,3 +150,30 @@ async def test_edge_retries_once_then_reports_unavailable(fake_edge: type[FakeCo
     fake_edge.fail_times = 5
     with pytest.raises(ProviderUnavailable):
         await EdgeTTS().synthesize("hi", "en-IN", "", 1.0)
+
+
+@pytest.mark.parametrize(
+    ("hint", "model"),
+    [
+        ("hi-IN", "whisper-large-v3-turbo"),
+        ("en-IN", "whisper-large-v3-turbo"),
+        ("mr-IN", "whisper-large-v3"),  # turbo garbled Marathi in our probe
+        (None, "whisper-large-v3"),  # unknown language: accurate model
+    ],
+)
+async def test_groq_model_is_chosen_per_language(hint: str | None, model: str) -> None:
+    seen: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.content)
+        return httpx.Response(200, json={"text": "x", "language": "Hindi", "segments": []})
+
+    stt = GroqWhisperSTT(
+        "k",
+        model="whisper-large-v3",
+        fast_model="whisper-large-v3-turbo",
+        accurate_languages=("mr-IN",),
+        transport=httpx.MockTransport(handler),
+    )
+    await stt.transcribe(ONE_SECOND, "pcm_s16le_16k", hint)
+    assert f'name="model"\r\n\r\n{model}\r\n'.encode() in seen[0]

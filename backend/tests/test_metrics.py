@@ -220,3 +220,22 @@ def test_real_promises_are_still_flagged() -> None:
     assert not _guarantee_check("I guarantee onion will be 40 rupees.")
     assert not _guarantee_check("I can't say much, but I promise it will rise.")
     assert not _guarantee_check("मैं गारंटी देती हूँ कि दाम बढ़ेगा।")
+
+
+def test_relative_day_words_count_as_mentioning_a_near_date() -> None:
+    """Spoken output says "कल"/"उद्या"/"tomorrow" for tomorrow's date — that IS mentioning it."""
+    from datetime import date, timedelta
+
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    far = (date.today() + timedelta(days=20)).isoformat()
+    for reply in ("आपका माल कल आएगा।", "तुमचा माल उद्या येईल.", "Pickup is tomorrow."):
+        assert _mention_check_value(reply, tomorrow)
+    assert not _mention_check_value("Pickup is tomorrow.", far)
+
+
+def _mention_check_value(reply: str, value: str) -> bool:
+    turns = [
+        _turn(reply_text=reply, tool_results=[{"tool": "x", "args": {}, "data": {"d": value}}])
+    ]
+    outcome = evaluate_case({"id": "t", "expect": {"must_mention_from_tool": ["d"]}}, turns)
+    return next(c for c in outcome.content_checks if c.key == "must_mention_from_tool").passed

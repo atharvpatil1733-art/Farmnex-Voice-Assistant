@@ -102,3 +102,23 @@ async def test_warm_up_touches_embeddings_and_store_and_never_raises() -> None:
     assert calls == ["match"]
     await _warm_up(pack, FakeEmbedding(dim=4), Broken())  # logged, not raised
     await _warm_up(pack, FakeEmbedding(dim=4), None)
+
+
+async def test_warm_up_warms_clients_best_effort() -> None:
+    from app.main import _warm_up
+    from voice_core.adapters.fakes.embeddings import FakeEmbedding
+    from voice_core.packs.loader import load_pack
+
+    pack = load_pack("farm_marketplace", Path(__file__).resolve().parents[2] / "domain_packs")
+    warmed: list[str] = []
+
+    class Good:
+        async def warm(self) -> None:
+            warmed.append("good")
+
+    class Bad:
+        async def warm(self) -> None:
+            raise ConnectionError("offline")
+
+    await _warm_up(pack, FakeEmbedding(dim=4), None, (Bad(), Good(), object()))
+    assert warmed == ["good"]

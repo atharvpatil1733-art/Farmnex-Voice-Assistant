@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,7 @@ from voice_core.agent.loop import TurnResult, resolve_pending_action, run_text_t
 from voice_core.packs.loader import load_pack
 from voice_core.ports.types import (
     Done,
+    LLMError,
     LLMEvent,
     TextDelta,
     ToolCall,
@@ -480,3 +481,387 @@ async def test_cancelling_the_turn_does_not_abort_an_executing_write(
         await asyncio.sleep(0)
     assert store.actions[action.id].status == "executed_ok"
     assert any(i.kind == "write" for i in store.invocations)
+
+
+async def test_auto_retrieval_can_be_switched_off(run) -> None:
+    """Knowledge search only when the AI asks for it: no per-turn lookup (saves ~1.2 s)."""
+    from voice_core.adapters.fakes.embeddings import FakeEmbedding
+    from voice_core.adapters.fakes.knowledge import FakeKnowledgeStore
+    from voice_core.ports.types import Chunk
+
+    class Spy(FakeKnowledgeStore):
+        matches = 0
+
+        async def match(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            Spy.matches += 1
+            return await super().match(*args, **kwargs)
+
+    knowledge = Spy(
+        [Chunk(doc_slug="pre-bidding-basics", doc_version=1, heading="h", text="t", similarity=0.9)]
+    )
+    llm = FakeLLM([TextDelta(text="ok"), Done(usage=Usage(0, 0))])
+
+    result = await run(
+        llm,
+        "when will I get paid?",
+        language="en-IN",
+        embeddings=FakeEmbedding(dim=4),
+        knowledge_store=knowledge,
+        auto_rag_min_sim=None,
+    )
+
+    assert Spy.matches == 0
+    assert result.knowledge_used == []
+
+
+async def test_search_knowledge_tool_records_knowledge_used(pack, handler, conv) -> None:
+    from voice_core.adapters.fakes.embeddings import FakeEmbedding
+    from voice_core.adapters.fakes.knowledge import FakeKnowledgeStore
+    from voice_core.ports.types import Chunk
+
+    store, conversation_id = conv
+    knowledge = FakeKnowledgeStore(
+        [Chunk(doc_slug="crop-rescue-basics", doc_version=2, heading="h", text="t", similarity=0.9)]
+    )
+    registry = ToolRegistry(pack, embeddings=FakeEmbedding(dim=4), knowledge_store=knowledge)
+    llm = SequencedFakeLLM(
+        [
+            [
+                ToolCall(id="k", name="search_knowledge", args_json='{"query":"crop rescue"}'),
+                Done(usage=Usage(0, 0)),
+            ],
+            _text("It sells produce fast."),
+        ]
+    )
+
+    result = await run_text_turn(
+        pack=pack,
+        registry=registry,
+        handler=handler,
+        llm=llm,
+        store=store,
+        conversation_id=conversation_id,
+        ctx=ToolContext(user_ref="u-1", language="en-IN"),
+        language="en-IN",
+        history=[],
+        user_text="what is crop rescue?",
+        auto_rag_min_sim=None,
+    )
+
+    assert result.knowledge_used == ["crop-rescue-basics"]
+
+
+class Spoken:
+    """Collects early fixed-phrase answers the loop hands to the voice layer."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    async def __call__(self, text: str) -> None:
+        self.texts.append(text)
+
+
+def _bids_then(second_round: list[LLMEvent]) -> SequencedFakeLLM:
+    return SequencedFakeLLM(
+        [
+            [
+                ToolCall(id="1", name="get_bids_for_listing", args_json='{"listing_ref":"latest"}'),
+                Done(usage=Usage(0, 0)),
+            ],
+            second_round,
+        ]
+    )
+
+
+BIDS_ANSWER_HI = "आपके 500 किलो प्याज़ पर 3 बोलियाँ आई हैं। सबसे ऊँची बोली 27 रुपये किलो है।"
+
+
+async def test_template_is_spoken_early_and_llm_adds_only_what_is_missing(run) -> None:
+    spoken = Spoken()
+    llm = _bids_then(_text("Bidding closes tomorrow evening."))
+
+    result = await run(llm, "मेरी प्याज़ पर कितनी बोली आई है", on_interim_answer=spoken)
+
+    assert spoken.texts == [BIDS_ANSWER_HI]
+    assert llm.call_count == 2  # the LLM still gets its round (the user might want more)
+    assert result.early_answer == BIDS_ANSWER_HI
+    assert result.reply_text == "Bidding closes tomorrow evening."  # spoken as the follow-up
+
+
+async def test_empty_follow_up_means_the_early_answer_said_it_all(run) -> None:
+    spoken = Spoken()
+    result = await run(_bids_then(_text("  ")), "bids?", on_interim_answer=spoken)
+    assert result.early_answer == BIDS_ANSWER_HI
+    assert result.reply_text == ""
+
+
+async def test_llm_failure_after_early_answer_still_says_the_rest_failed(run) -> None:
+    """Re-review S5: if the user also asked for an action, silence would suggest it's
+    happening. The localized failure phrase is spoken after the early answer."""
+    spoken = Spoken()
+    llm = _bids_then([LLMError(code="rate_limited", message="429", retryable=True)])
+    result = await run(llm, "bids?", on_interim_answer=spoken)
+    assert result.early_answer == BIDS_ANSWER_HI
+    assert result.reply_text == "माफ़ कीजिए, अभी जवाब नहीं दे पा रही। कृपया फिर से कोशिश करें।"
+
+
+async def test_llm_is_told_what_the_user_already_heard(run) -> None:
+    seen: list[list[Any]] = []
+
+    class Recording(SequencedFakeLLM):
+        async def stream(self, messages, tools, **kwargs):  # type: ignore[no-untyped-def]
+            seen.append(list(messages))
+            async for event in super().stream(messages, tools, **kwargs):
+                yield event
+
+    llm = Recording(_bids_then(_text(""))._scripts)
+    await run(llm, "bids?", on_interim_answer=Spoken())
+    second_round = seen[1]
+    assert any(m.role == "assistant" and m.content == BIDS_ANSWER_HI for m in second_round)
+    note = second_round[-1]
+    assert note.role == "user" and "already spoken" in note.content  # no trailing model turn
+    assert BIDS_ANSWER_HI not in note.content  # host-derived text never gets a note of its own
+
+
+async def test_action_request_still_reaches_the_write_after_an_early_answer(run, conv) -> None:
+    """Regression: "accept the highest bid" = bids lookup THEN accept_bid. The early answer
+    must not end the turn before the write is proposed."""
+    store, conversation_id = conv
+    spoken = Spoken()
+    llm = _bids_then(_write_call())
+
+    result = await run(llm, "सबसे ऊँची बोली स्वीकार कर दो", on_interim_answer=spoken)
+
+    assert spoken.texts == [BIDS_ANSWER_HI]
+    assert result.pending_action == "accept_bid"
+    assert result.early_answer == BIDS_ANSWER_HI
+    assert (await store.get_open_pending(conversation_id)) is not None
+
+
+async def test_without_the_voice_hook_no_template_is_used(run) -> None:
+    """Text API / evals keep the plain LLM flow."""
+    llm = _bids_then(_text("LLM-WORDED ANSWER"))
+    result = await run(llm, "bids?")
+    assert result.reply_text == "LLM-WORDED ANSWER"
+    assert result.early_answer is None
+
+
+async def test_template_dates_are_spoken_in_the_reply_language(run) -> None:
+    from datetime import timedelta
+
+    spoken = Spoken()
+    llm = SequencedFakeLLM(
+        [
+            [ToolCall(id="1", name="get_order_status", args_json="{}"), Done(usage=Usage(0, 0))],
+            _text("unused"),
+        ]
+    )
+    today = date.today()
+    await run(
+        llm,
+        "When will I get paid for my soybean",
+        language="en-IN",
+        today=today,
+        on_interim_answer=spoken,
+    )
+    expected = today + timedelta(days=3)  # fixture: "{{date:+3}}"
+    month = expected.strftime("%B")
+    spoken_date = f"{expected.day} {month}" + (
+        "" if expected.year == today.year else f" {expected.year}"
+    )
+    assert spoken.texts == [
+        f"Payment for your soybean is being processed. The expected date is {spoken_date}."
+    ]
+
+
+async def test_past_dates_are_never_spoken_as_future_facts(
+    pack, registry, ctx, conv, tmp_path
+) -> None:
+    """Review repro: a pickup dated in the past must not be announced as "will be picked up";
+    closed bidding must not be presented as live. Both go to the LLM instead."""
+    import json
+    import shutil
+
+    store, conversation_id = conv
+    pack_copy = tmp_path / "pack"
+    shutil.copytree(pack.pack_dir, pack_copy)
+    for name, key, value in [
+        ("pickups.json", "pickup_date", "2020-01-01"),
+        ("bids.json", "bidding_ends_at", "2020-01-01T18:00:00+05:30"),
+    ]:
+        path = pack_copy / "fixtures" / name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["data"][key] = value
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    for tool, args in [
+        ("get_pickup_status", "{}"),
+        ("get_bids_for_listing", '{"listing_ref":"latest"}'),
+    ]:
+        spoken = Spoken()
+        llm = SequencedFakeLLM(
+            [[ToolCall(id="1", name=tool, args_json=args), Done(usage=Usage(0, 0))], _text("LLM")]
+        )
+        result = await run_text_turn(
+            pack=pack,
+            registry=registry,
+            handler=MockToolHandler(pack_copy),
+            llm=llm,
+            store=store,
+            conversation_id=conversation_id,
+            ctx=ctx,
+            language="hi-IN",
+            history=[],
+            user_text="?",
+            on_interim_answer=spoken,
+        )
+        assert spoken.texts == [], tool
+        assert result.reply_text == "LLM"
+
+
+async def test_unresolvable_template_speaks_nothing_early(pack, registry, ctx, conv) -> None:
+    store, conversation_id = conv
+    spoken = Spoken()
+    handler = MockToolHandler(
+        pack.pack_dir, fixture_overrides={"get_bids_for_listing": "fixtures/tool_error.json"}
+    )
+    result = await run_text_turn(
+        pack=pack,
+        registry=registry,
+        handler=handler,
+        llm=_bids_then(_text("LLM-WORDED ANSWER")),
+        store=store,
+        conversation_id=conversation_id,
+        ctx=ctx,
+        language="hi-IN",
+        history=[],
+        user_text="bids?",
+        on_interim_answer=spoken,
+    )
+    assert spoken.texts == []
+    assert result.reply_text == "LLM-WORDED ANSWER"
+
+
+async def test_answer_when_guard_sends_unusual_states_to_the_llm(
+    pack, registry, ctx, conv, tmp_path
+) -> None:
+    import json
+    import shutil
+
+    store, conversation_id = conv
+    pack_copy = tmp_path / "pack"
+    shutil.copytree(pack.pack_dir, pack_copy)
+    pickup = json.loads((pack_copy / "fixtures/pickups.json").read_text(encoding="utf-8"))
+    pickup["data"]["status"] = "delayed"
+    (pack_copy / "fixtures/pickups.json").write_text(json.dumps(pickup), encoding="utf-8")
+    spoken = Spoken()
+    llm = SequencedFakeLLM(
+        [
+            [ToolCall(id="1", name="get_pickup_status", args_json="{}"), Done(usage=Usage(0, 0))],
+            _text("LLM explains the delay"),
+        ]
+    )
+    result = await run_text_turn(
+        pack=pack,
+        registry=registry,
+        handler=MockToolHandler(pack_copy),
+        llm=llm,
+        store=store,
+        conversation_id=conversation_id,
+        ctx=ctx,
+        language="hi-IN",
+        history=[],
+        user_text="माल कब उठेगा",
+        on_interim_answer=spoken,
+    )
+    assert spoken.texts == []
+    assert result.reply_text == "LLM explains the delay"
+
+
+async def test_two_tools_in_one_round_are_left_to_the_llm(run) -> None:
+    spoken = Spoken()
+    llm = SequencedFakeLLM(
+        [
+            [
+                ToolCall(id="1", name="get_order_status", args_json="{}"),
+                ToolCall(id="2", name="get_pickup_status", args_json="{}"),
+                Done(usage=Usage(0, 0)),
+            ],
+            _text("combined answer"),
+        ]
+    )
+    result = await run(llm, "order and pickup?", language="en-IN", on_interim_answer=spoken)
+    assert spoken.texts == []
+    assert result.reply_text == "combined answer"
+
+
+@pytest.mark.parametrize(
+    ("language", "expected"),
+    [
+        ("hi-IN", "आपका माल कल, सुबह नौ बजे से सुबह ग्यारह बजे के बीच उठेगा। ड्राइवर Sunil आएँगे।"),
+        (
+            "mr-IN",
+            "तुमचा माल उद्या, सकाळी नऊ वाजता ते सकाळी अकरा वाजता या वेळेत नेला जाईल. ड्रायव्हर Sunil येतील.",
+        ),
+        (
+            "en-IN",
+            "Pickup date: tomorrow, between 9 in the morning and 11 in the morning. "
+            "Your driver is Sunil.",
+        ),
+    ],
+)
+async def test_pickup_early_answer_reads_naturally_with_relative_dates(
+    run, language: str, expected: str
+) -> None:
+    """Fixture pickup is "{{date:+1}}": the spoken date is "कल"/"उद्या"/"tomorrow", so the
+    template must not glue a preposition to it ("कल को", "on tomorrow")."""
+    spoken = Spoken()
+    llm = SequencedFakeLLM(
+        [
+            [ToolCall(id="1", name="get_pickup_status", args_json="{}"), Done(usage=Usage(0, 0))],
+            _text(""),
+        ]
+    )
+    await run(llm, "?", language=language, on_interim_answer=spoken)
+    assert spoken.texts == [expected]
+
+
+async def test_read_audit_runs_off_the_critical_path_but_always_completes(
+    pack, registry, ctx, handler
+) -> None:
+    """Remote DB round trips (~0.5 s) must not delay the answer; the audit row still lands
+    before the turn ends (golden rule: every tool call is audited)."""
+    import asyncio
+    import time as time_module
+
+    events: list[tuple[str, float]] = []
+
+    class SlowStore(FakeConversationStore):
+        async def record_invocation(self, invocation):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(0.3)
+            events.append(("audit_done", time_module.perf_counter()))
+            await super().record_invocation(invocation)
+
+    store = SlowStore()
+    conversation_id = await store.create_conversation("u-1", "farm_marketplace", "eval", "hi-IN")
+
+    async def spoken(text: str) -> None:
+        events.append(("spoken", time_module.perf_counter()))
+
+    await run_text_turn(
+        pack=pack,
+        registry=registry,
+        handler=handler,
+        llm=_bids_then(_text("")),
+        store=store,
+        conversation_id=conversation_id,
+        ctx=ctx,
+        language="hi-IN",
+        history=[],
+        user_text="bids?",
+        on_interim_answer=spoken,
+    )
+
+    order = [name for name, _ in sorted(events, key=lambda e: e[1])]
+    assert order == ["spoken", "audit_done"]
+    assert [i.tool_name for i in store.invocations] == ["get_bids_for_listing"]

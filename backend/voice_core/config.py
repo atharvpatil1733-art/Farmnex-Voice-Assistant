@@ -39,14 +39,17 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     groq_api_key: str = ""
     groq_base_url: str = "https://api.groq.com/openai/v1"
-    # For Groq gpt-oss reasoning models: "low" is faster and sends back no reasoning text
-    # (fewer tokens against the free tier's 8K tokens/min); same tool choices in our test.
-    llm_reasoning_effort: str = "low"
+    # Groq gpt-oss reasoning models. Reasoning text is never sent back (fewer tokens against
+    # the free 8K tokens/min). "medium" (Groq default): "low" was only ~0.15 s faster and
+    # the golden suite showed weaker multi-step tool use with it (2026-09-27).
+    llm_reasoning_effort: str = "medium"
 
     # STT / TTS
     stt_provider: Literal["sarvam", "groq", "fake"] = "fake"
     stt_model: str = "saaras:v3"  # Sarvam model
     groq_stt_model: str = "whisper-large-v3"  # best hi/mr accuracy in our probe, 2026-09-25
+    groq_stt_model_fast: str = "whisper-large-v3-turbo"  # hi/en: faster, accepted trade-off
+    groq_stt_accurate_languages: str = "mr-IN"  # comma-separated; these use groq_stt_model
     stt_mode: str = "transcribe"
     tts_provider: Literal["sarvam", "edge", "fake"] = "fake"
     tts_model: str = "bulbul:v3"
@@ -58,6 +61,9 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-m3"
     embedding_dim: int = 1024
     auto_rag_min_sim: float = 0.45
+    # Off: no knowledge search on every turn (~1.2 s); the LLM calls search_knowledge only
+    # for how-to questions. Chosen for voice latency, 2026-09-27.
+    auto_rag_enabled: bool = False
 
     # Host app backend
     host_api_base_url: str = "http://localhost:9000"
@@ -66,6 +72,8 @@ class Settings(BaseSettings):
 
     # Limits & privacy
     max_utterance_seconds: int = 30
+    # Play the pack filler if no answer is ready this long into thinking (seconds).
+    voice_filler_after_s: float = 0.8
     rate_limit_turns_per_min: int = 20
     rate_limit_turns_per_day: int = 300
     store_audio: bool = False

@@ -166,3 +166,87 @@ async def test_tool_call_counts_as_output_started() -> None:
 
     assert events == [call, error]
     assert second.calls == 0
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _rate_limited(message: str = "429 per minute") -> LLMError:
+    return LLMError(code="rate_limited", message=message, retryable=True)
+
+
+async def test_rate_limited_link_is_skipped_until_its_cooldown_ends() -> None:
+    """Circuit breaker: a link that returned 429 isn't retried on every round (each retry cost
+    0.2-0.5 s of dead air per LLM round) until its cooldown has passed."""
+    clock = _Clock()
+    first = _ScriptedLLM("first", [_rate_limited()])
+    second = _ScriptedLLM("second", [TextDelta(text="ok"), Done(usage=Usage(0, 0))])
+    llm = FallbackLLM([("first", first), ("second", second)], clock=clock)
+
+    await _run(llm)
+    await _run(llm)
+    assert (first.calls, second.calls) == (1, 2)  # 2nd round went straight to "second"
+
+    clock.now += 61
+    await _run(llm)
+    assert first.calls == 2  # cooldown over: tried again
+
+
+async def test_daily_quota_cools_down_for_longer() -> None:
+    clock = _Clock()
+    first = _ScriptedLLM(
+        "first", [_rate_limited("429 GenerateRequestsPerDayPerProjectPerModel-FreeTier")]
+    )
+    second = _ScriptedLLM("second", [TextDelta(text="ok"), Done(usage=Usage(0, 0))])
+    llm = FallbackLLM([("first", first), ("second", second)], clock=clock)
+
+    await _run(llm)
+    clock.now += 600
+    await _run(llm)
+    assert first.calls == 1  # still cooling after 10 min
+
+
+async def test_when_every_link_is_cooling_the_soonest_to_recover_is_tried() -> None:
+    clock = _Clock()
+    first = _ScriptedLLM("first", [_rate_limited("per day quota")])
+    second = _ScriptedLLM("second", [_rate_limited()])
+    llm = FallbackLLM([("first", first), ("second", second)], clock=clock)
+
+    await _run(llm)  # both fail and start cooling (first: long, second: short)
+    events = await _run(llm)
+    assert (first.calls, second.calls) == (1, 2)
+    assert isinstance(events[-1], LLMError)
+
+
+async def test_non_rate_limit_errors_do_not_open_the_breaker() -> None:
+    clock = _Clock()
+    first = _ScriptedLLM("first", [LLMError(code="unavailable", message="503", retryable=True)])
+    second = _ScriptedLLM("second", [TextDelta(text="ok"), Done(usage=Usage(0, 0))])
+    llm = FallbackLLM([("first", first), ("second", second)], clock=clock)
+
+    await _run(llm)
+    await _run(llm)
+    assert first.calls == 2
+
+
+async def test_warm_calls_links_that_support_it_and_ignores_failures() -> None:
+    warmed: list[str] = []
+
+    class Warmable(_ScriptedLLM):
+        async def warm(self) -> None:
+            warmed.append(self.name)
+
+    class Broken(_ScriptedLLM):
+        async def warm(self) -> None:
+            raise ConnectionError("offline")
+
+    llm = FallbackLLM(
+        [("a", Broken("a", [])), ("b", Warmable("b", [])), ("c", _ScriptedLLM("c", []))]
+    )
+    await llm.warm()
+    assert warmed == ["b"]

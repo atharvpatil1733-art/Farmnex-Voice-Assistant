@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -117,6 +118,10 @@ class _EvalClock:
         return self.now
 
 
+async def _discard(_: str) -> None:
+    """Eval stand-in for the voice layer's "speak now" hook."""
+
+
 async def run_case(
     case: dict[str, Any],
     pack: LoadedPack,
@@ -124,11 +129,15 @@ async def run_case(
     llm: LLMProvider,
     embeddings: EmbeddingProvider | None = None,
     knowledge_store: KnowledgeStore | None = None,
-    auto_rag_min_sim: float = 0.45,
+    auto_rag_min_sim: float | None = 0.45,
+    voice: bool = False,
 ) -> list[TurnResult]:
     """Run one case against a fresh in-memory ConversationStore (evals never touch the real
     conversation tables). Turns are {"user": text}, {"button": "yes"|"no"} for the confirm
-    card, and may carry "advance_seconds" to move the clock first (expiry cases)."""
+    card, and may carry "advance_seconds" to move the clock first (expiry cases).
+
+    voice=True runs the voice path: early fixed-phrase answers are enabled, and each turn is
+    scored on what the user hears (early answer + anything the LLM added)."""
     handler = MockToolHandler(pack.pack_dir, fixture_overrides=case.get("fixture_overrides"))
     ctx = ToolContext(user_ref="eval-user", language=case["language"])
     store = FakeConversationStore()
@@ -193,7 +202,11 @@ async def run_case(
             knowledge_store=knowledge_store,
             auto_rag_min_sim=auto_rag_min_sim,
             clock=clock,
+            on_interim_answer=_discard if voice else None,
         )
+        if result.early_answer:
+            heard = " ".join(t for t in (result.early_answer, result.reply_text) if t)
+            result = replace(result, reply_text=heard)
         results.append(result)
         history.append(ChatMessage(role="user", content=user_text))
         history.append(ChatMessage(role="assistant", content=result.reply_text))
@@ -403,9 +416,14 @@ async def _main_async(args: argparse.Namespace) -> int:
                 llm,
                 embeddings=embeddings,
                 knowledge_store=knowledge_store,
-                auto_rag_min_sim=settings.auto_rag_min_sim,
+                auto_rag_min_sim=settings.auto_rag_min_sim if settings.auto_rag_enabled else None,
+                voice=args.voice,
             )
             outcomes.append(evaluate_case(case, turns, pack_tool_names))
+            if args.gap_s:
+                # Free tiers limit tokens per minute; spacing cases measures the agent,
+                # not the quota (back-to-back runs exhausted every provider, 2026-09-27).
+                await asyncio.sleep(args.gap_s)
             # Write after every case so a killed/interrupted run still leaves usable partial
             # results instead of nothing (this suite can take 10-20+ minutes on a throttled
             # free-tier API key).
@@ -436,6 +454,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--offset", type=int, default=0, help="skip the first N cases")
     parser.add_argument("--limit", type=int, default=0, help="run at most N cases (0 = all)")
+    parser.add_argument("--gap-s", type=float, default=0.0, help="pause between cases")
+    parser.add_argument(
+        "--voice", action="store_true", help="voice path: early fixed-phrase answers enabled"
+    )
     return parser.parse_args(argv)
 
 

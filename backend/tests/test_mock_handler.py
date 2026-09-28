@@ -67,3 +67,17 @@ async def test_crops_json_is_never_read_by_the_mock_handler() -> None:
     tools = yaml.safe_load((PACK_DIR / "tools.yaml").read_text(encoding="utf-8"))
     fixture_paths = {t["handler"]["fixture"] for t in tools}
     assert "fixtures/crops.json" not in fixture_paths
+
+
+def test_relative_date_tokens_resolve_against_today() -> None:
+    from datetime import date
+
+    from voice_core.tools.handlers.mock import relative_dates
+
+    today = date(2026, 9, 27)
+    value = {"a": "{{date:+3}}", "b": ["{{date:-1}}T18:00:00+05:30"], "c": 5}
+    assert relative_dates(value, today) == {
+        "a": "2026-09-30",
+        "b": ["2026-09-26T18:00:00+05:30"],
+        "c": 5,
+    }

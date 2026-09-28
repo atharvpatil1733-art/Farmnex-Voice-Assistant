@@ -27,7 +27,8 @@ from voice_core.ports.errors import (
 from voice_core.ports.types import AudioFormat, Transcript
 from voice_core.speech.audio import MIN_AUDIO_MS, pcm16_duration_ms, pcm16_to_wav
 
-DEFAULT_MODEL = "whisper-large-v3"
+DEFAULT_MODEL = "whisper-large-v3"  # accurate: used for `accurate_languages`
+FAST_MODEL = "whisper-large-v3-turbo"  # ~0.3-0.5 s quicker; fine for hi/en, garbles Marathi
 NO_SPEECH_THRESHOLD = 0.6  # Whisper invents text for silence; drop segments it flags as such
 _LANGUAGE_NAMES = {"hindi": "hi-IN", "marathi": "mr-IN", "english": "en-IN"}
 
@@ -39,12 +40,16 @@ class GroqWhisperSTT:
         *,
         base_url: str = "https://api.groq.com/openai/v1",
         model: str = DEFAULT_MODEL,
+        fast_model: str | None = FAST_MODEL,
+        accurate_languages: tuple[str, ...] = ("mr-IN",),
         timeout_s: float = 15.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("GROQ_API_KEY is not set")
         self._model = model
+        self._fast_model = fast_model or model
+        self._accurate_languages = accurate_languages
         self._client = httpx.AsyncClient(
             base_url=base_url,
             headers={"Authorization": f"Bearer {api_key}"},
@@ -54,6 +59,10 @@ class GroqWhisperSTT:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def warm(self) -> None:
+        """Open the TLS connection before the first turn (the models endpoint costs no quota)."""
+        await self._client.get("/models")
 
     async def transcribe(
         self, audio: bytes, fmt: AudioFormat, language_hint: str | None
@@ -71,7 +80,10 @@ class GroqWhisperSTT:
         else:
             raise ProviderBadRequest(f"unsupported input format {fmt!r}")
 
-        data = {"model": self._model, "response_format": "verbose_json"}
+        # No hint = unknown language: use the accurate model (turbo garbles Marathi).
+        fast_ok = language_hint is not None and language_hint not in self._accurate_languages
+        model = self._fast_model if fast_ok else self._model
+        data = {"model": model, "response_format": "verbose_json"}
         if language_hint:
             data["language"] = language_hint.split("-")[0]  # ISO-639-1: "hi", "mr", "en"
         body = await self._post(files={"file": upload}, data=data)

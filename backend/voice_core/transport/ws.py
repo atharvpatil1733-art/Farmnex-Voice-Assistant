@@ -50,6 +50,7 @@ SESSION_START_TIMEOUT_S = 5.0
 # If no answer is ready this long after thinking starts, play the pack's short filler
 # ("one moment..."), pre-synthesized per session so it costs no TTS time (SPEC §6 step 5).
 FILLER_AFTER_S = 0.8
+PERSIST_WAIT_S = 3.0  # on disconnect, how long to let in-flight transcript writes land
 HISTORY_MESSAGES = 16  # SPEC §5: last 8 turns verbatim
 TTS_CONCURRENCY = 2
 PCM_BYTES_PER_MS = 32  # 16 kHz * 2 bytes / 1000
@@ -71,9 +72,10 @@ class VoiceDeps:
     max_utterance_ms: int
     audio_out_encoding: p.AudioEncoding = "wav"
     audio_out_sample_rate: int = 22_050
+    filler_after_s: float | None = None  # None: module default FILLER_AFTER_S
     embeddings: EmbeddingProvider | None = None
     knowledge_store: KnowledgeStore | None = None
-    auto_rag_min_sim: float = 0.45
+    auto_rag_min_sim: float | None = 0.45  # None: no per-turn knowledge lookup
 
 
 @router.websocket("/voice")
@@ -100,7 +102,8 @@ class VoiceSession:
         self._open_action_id: str | None = None
         self._resolved_actions: set[str] = set()  # ids already answered with action.result
         self._filler_audio: dict[str, bytes] = {}  # language -> pre-synthesized filler
-        self._background: set[asyncio.Task[None]] = set()
+        self._background: set[asyncio.Task[None]] = set()  # cancellable (filler synth)
+        self._persisting: set[asyncio.Task[None]] = set()  # transcript writes: never cancel
 
     @property
     def language(self) -> str:
@@ -129,6 +132,8 @@ class VoiceSession:
             await self._interrupt()
             for task in list(self._background):
                 task.cancel()
+            if self._persisting:  # let in-flight transcript rows land (bounded)
+                await asyncio.wait(list(self._persisting), timeout=PERSIST_WAIT_S)
             if self._ws.client_state == WebSocketState.CONNECTED:
                 with contextlib.suppress(Exception):
                     await self._ws.close()
@@ -360,8 +365,9 @@ class _Turn:
         self.protected = False
         self.muted = False
         self.confirming_action_id: str | None = None
-        self.proposed_action_id: str | None = None
         self.confirm_sent = False
+        # The action (if any) whose card was already shown when this turn began.
+        self.open_at_start = session._open_action_id
 
     @property
     def d(self) -> VoiceDeps:
@@ -433,18 +439,11 @@ class _Turn:
     async def _think(self, user_text: str, *, input_mode: Literal["voice", "text"]) -> TurnResult:
         # With an action awaiting confirmation, this utterance may be the "yes" that executes it.
         self.protected = self.s._open_action_id is not None
-        try:
-            await self.d.store.add_message(
-                self.s._conversation_id,
-                turn_id=self.turn_id,
-                role="user",
-                content=user_text,
-                language=self.s.language,
-                input_mode=input_mode,
-                stt_confidence=self.stt_confidence,
-            )
-        except Exception:
-            logger.warning("transcript_persist_failed", exc_info=True)  # best-effort
+        # Save the transcript while the LLM works (a remote DB round trip costs ~0.5 s);
+        # awaited below so it always completes. Best-effort: a failure is only logged.
+        persist = asyncio.create_task(self._persist_user_message(user_text, input_mode))
+        self.s._persisting.add(persist)  # strong ref even if this turn is cancelled
+        persist.add_done_callback(self.s._persisting.discard)
         await self.s._send(p.State(value="thinking"))
         if not self.filler_played and self.filler is None:
             self.filler = asyncio.create_task(self._filler_after_delay())
@@ -465,18 +464,34 @@ class _Turn:
                 knowledge_store=self.d.knowledge_store,
                 auto_rag_min_sim=self.d.auto_rag_min_sim,
                 on_tool=self._on_tool,
+                on_interim_answer=self._early_answer,
             )
-        if result.pending_status == "pending" and result.pending_action_id:
-            self.proposed_action_id = result.pending_action_id
+        await persist  # a cancel here is safe: _finish withdraws any unannounced proposal
         if result.reply_language != language_before:
             # The LLM called set_preferred_language: an explicit request, so persist it.
             await self.s._set_language(result.reply_language)
         self.s._history = [
             *self.s._history,
             ChatMessage(role="user", content=user_text),
-            ChatMessage(role="assistant", content=result.reply_text),
+            ChatMessage(role="assistant", content=_full_reply(result)),
         ][-HISTORY_MESSAGES:]
         return result
+
+    async def _persist_user_message(
+        self, user_text: str, input_mode: Literal["voice", "text"]
+    ) -> None:
+        try:
+            await self.d.store.add_message(
+                self.s._conversation_id,
+                turn_id=self.turn_id,
+                role="user",
+                content=user_text,
+                language=self.s.language,
+                input_mode=input_mode,
+                stt_confidence=self.stt_confidence,
+            )
+        except Exception:
+            logger.warning("transcript_persist_failed", exc_info=True)
 
     async def _confirm(self, msg: p.ConfirmResponse) -> TurnResult | None:
         action, _ = await ConfirmationGate(self.d.store).current(self.s._conversation_id)
@@ -505,7 +520,8 @@ class _Turn:
         await self.s._send(p.ToolActivity(turn_id=self.turn_id, phase=phase, label=label))
 
     async def _filler_after_delay(self) -> None:
-        await asyncio.sleep(FILLER_AFTER_S)
+        delay = self.d.filler_after_s
+        await asyncio.sleep(FILLER_AFTER_S if delay is None else delay)
         language = self.s.language
         text = self.d.pack.fillers.get(language)
         if not text or self.muted:
@@ -521,7 +537,7 @@ class _Turn:
 
     async def _deliver(self, result: TurnResult, user_text: str | None) -> None:
         language = result.reply_language
-        self.reply_text = result.reply_text
+        self.reply_text = _full_reply(result)
         self.reply_language = language
         if result.pending_action_id and result.pending_status == "pending":
             await self._send_confirm_request(result)
@@ -539,7 +555,7 @@ class _Turn:
             self.s._open_action_id = None
 
         await self.s._send(
-            p.AssistantTextFinal(turn_id=self.turn_id, text=result.reply_text, language=language)
+            p.AssistantTextFinal(turn_id=self.turn_id, text=_full_reply(result), language=language)
         )
         if self.filler is not None and not self.filler.done():
             if self.filler_played:
@@ -549,6 +565,21 @@ class _Turn:
                 self.filler.cancel()
         if result.reply_text:
             await self._speak(split_sentences(result.reply_text), language=language, final=True)
+        elif result.early_answer:
+            await self._end_audio()  # the early answer said it all: just close the audio
+
+    async def _early_answer(self, text: str) -> None:
+        """A pack fixed-phrase answer, spoken while the LLM keeps working (voice latency)."""
+        if self.muted:
+            return
+        if self.filler is not None and not self.filler.done():
+            if self.filler_played:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.filler  # keep order: filler, then the answer
+            else:
+                self.filler.cancel()
+        await self.s._send(p.AssistantTextDelta(turn_id=self.turn_id, text=text))
+        await self._speak(split_sentences(text), final=False, answer=True)
 
     async def _send_confirm_request(self, result: TurnResult) -> None:
         action, _ = await ConfirmationGate(self.d.store).current(self.s._conversation_id)
@@ -558,8 +589,13 @@ class _Turn:
         if previous is not None and previous != action.id:
             # The new proposal replaced the old one (the store cancelled it): drop its card.
             await self.s._send(p.ActionResult(action_id=previous, status="cancelled"))
-        self.s._open_action_id = action.id
-        self.confirm_sent = True
+            self.s._open_action_id = None
+        if self.muted:
+            # Barge-in while this (protected) turn finished: the user will never hear this
+            # question, so it is withdrawn rather than shown silently (golden rule 4).
+            await ConfirmationGate(self.d.store).cancel(action)
+            await self.s._send(p.ActionResult(action_id=action.id, status="cancelled"))
+            return
         language = result.reply_language
         await self.s._send(
             p.ConfirmRequest(
@@ -573,6 +609,10 @@ class _Turn:
                 },
             )
         )
+        # Only now is the question actually delivered: a cancel while the send was queued
+        # leaves these unset, so _finish withdraws the action.
+        self.s._open_action_id = action.id
+        self.confirm_sent = True
 
     async def _send_segment(self, data: bytes, *, is_last: bool) -> None:
         await self.s._send(
@@ -589,14 +629,25 @@ class _Turn:
         self.seq += 1
         self.timer.mark("first_audio_total")
 
+    async def _end_audio(self) -> None:
+        """Close the turn's audio with an empty `is_last` segment (only if audio was sent)."""
+        if self.seq > 0 and not self.muted:
+            await self._send_segment(b"", is_last=True)
+
     async def _speak(
-        self, sentences: list[str], *, final: bool, language: str | None = None
+        self,
+        sentences: list[str],
+        *,
+        final: bool,
+        language: str | None = None,
+        answer: bool | None = None,
     ) -> None:
         """TTS each sentence (bounded concurrency), send segments strictly in order. Only the
         final reply's audio ends with `is_last` (never the filler), and it always does, even if
         the last sentence's TTS fails (an empty terminal segment is sent then)."""
         if self.muted:
             return
+        is_answer = final if answer is None else answer  # filler: False; early answer: True
         language = language or self.s.language
         today = datetime.now(ZoneInfo(self.d.pack.timezone)).date()
         spoken = [
@@ -624,7 +675,7 @@ class _Turn:
             for index, (text, task) in enumerate(zip(spoken, tasks, strict=True)):
                 if self.muted:
                     break
-                first = final and not self.answer_audio_sent
+                first = is_answer and not self.answer_audio_sent
                 try:
                     if first:
                         with self.timer.span("tts_first_audio"):
@@ -652,7 +703,7 @@ class _Turn:
                 self.seq += 1
                 self.spoken.append(text)
                 self.timer.mark("first_audio_total")
-                if final:
+                if is_answer:
                     self.answer_audio_sent = True
                     self.timer.mark("first_answer_audio")  # the real answer, not the filler
         finally:
@@ -673,14 +724,20 @@ class _Turn:
             self.seq += 1
 
     async def _finish(self, interrupted: bool) -> None:
-        if self.proposed_action_id and not self.confirm_sent:
-            # Interrupted after proposing but before the question was sent: a later bare "yes"
-            # must not be able to execute something the user never saw or heard.
+        if not self.confirm_sent:
+            # Golden rule 4: any action that became pending during this turn but whose
+            # question was never sent (interrupted at *any* await after the store wrote it)
+            # is cancelled, so a later bare "yes" can't execute something never heard.
             with contextlib.suppress(Exception):
                 gate = ConfirmationGate(self.d.store)
                 action, _ = await gate.current(self.s._conversation_id)
-                if action is not None and action.id == self.proposed_action_id:
-                    await gate.cancel(action)
+                if (
+                    action is not None
+                    and action.status == "pending"
+                    and action.id != self.open_at_start
+                ):
+                    if await gate.cancel(action):
+                        await self.s._send(p.ActionResult(action_id=action.id, status="cancelled"))
         self.timer.mark("turn_total")
         latency = self.timer.as_dict()
         with contextlib.suppress(Exception):
@@ -705,3 +762,8 @@ class _Turn:
         await self.s._send(
             p.State(value="awaiting_confirmation" if self.s._open_action_id else "idle")
         )
+
+
+def _full_reply(result: TurnResult) -> str:
+    """What the user got this turn: the early fixed-phrase answer plus anything added after it."""
+    return " ".join(part for part in (result.early_answer, result.reply_text) if part)

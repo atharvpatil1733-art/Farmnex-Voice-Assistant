@@ -183,7 +183,9 @@ def test_first_message_must_be_session_start() -> None:
 def test_voice_read_turn_runs_the_full_pipeline_in_order() -> None:
     llm = SequencedLLM(
         [
-            ToolCall(id="1", name="get_bids_for_listing", args_json='{"listing_ref":"latest"}'),
+            ToolCall(
+                id="1", name="get_demand_forecast", args_json='{"crop":"onion"}'
+            ),  # no template: LLM words the reply
             Done(usage=Usage(0, 0)),
         ],
         _reply("सबसे ऊँची बोली ₹27/kg है। पुणे के खरीदार की है।"),
@@ -423,7 +425,9 @@ def test_filler_is_never_marked_last_and_the_reply_ends_with_is_last(
     monkeypatch.setattr(ws_module, "FILLER_AFTER_S", 0.05)
     llm = SequencedLLM(
         [
-            ToolCall(id="1", name="get_bids_for_listing", args_json='{"listing_ref":"latest"}'),
+            ToolCall(
+                id="1", name="get_demand_forecast", args_json='{"crop":"onion"}'
+            ),  # no template
             Done(usage=Usage(0, 0)),
         ],
         _reply("सबसे ऊँची बोली 27 रुपये है।"),
@@ -529,3 +533,137 @@ def test_fast_answer_plays_no_filler() -> None:
         _speak(ws)
         messages, _ = _collect_turn(ws)
     assert len([m for m in messages if m["type"] == "audio.segment"]) == 1
+
+
+def _bids_llm(follow_up: str) -> SequencedLLM:
+    return SequencedLLM(
+        [
+            ToolCall(id="1", name="get_bids_for_listing", args_json='{"listing_ref":"latest"}'),
+            Done(usage=Usage(0, 0)),
+        ],
+        _reply(follow_up),
+    )
+
+
+def test_template_answer_is_spoken_early_and_nothing_repeated() -> None:
+    client, _, tts = _make(stt=ScriptedSTT(_t("मेरी बोली कितनी आई")), llm=_bids_llm(""))
+    with client.websocket_connect("/v1/voice") as ws:
+        _start(ws)
+        _speak(ws)
+        messages, audio = _collect_turn(ws)
+    delta = next(m for m in messages if m["type"] == "assistant.text.delta")
+    final = next(m for m in messages if m["type"] == "assistant.text.final")
+    assert delta["text"] == final["text"]
+    segments = [m for m in messages if m["type"] == "audio.segment"]
+    assert [s["is_last"] for s in segments] == [False, False, True]  # 2 sentences + terminal
+    assert audio[-1] == b""
+    latency = next(m for m in messages if m["type"] == "turn.end")["latency_ms"]
+    assert "first_answer_audio" in latency
+
+
+def test_llm_follow_up_is_spoken_after_the_early_answer() -> None:
+    client, _, tts = _make(
+        stt=ScriptedSTT(_t("मेरी बोली कितनी आई")), llm=_bids_llm("बोली कल शाम बंद होगी।")
+    )
+    with client.websocket_connect("/v1/voice") as ws:
+        _start(ws)
+        _speak(ws)
+        messages, _ = _collect_turn(ws)
+    final = next(m for m in messages if m["type"] == "assistant.text.final")
+    assert final["text"].endswith("बोली कल शाम बंद होगी।")
+    assert tts.texts[-1] == "बोली कल शाम बंद होगी।"
+    segments = [m for m in messages if m["type"] == "audio.segment"]
+    assert [s["is_last"] for s in segments] == [False, False, True]  # early answer, follow-up
+
+
+def test_action_after_early_answer_still_asks_for_confirmation() -> None:
+    llm = SequencedLLM(
+        [
+            ToolCall(id="1", name="get_bids_for_listing", args_json='{"listing_ref":"latest"}'),
+            Done(usage=Usage(0, 0)),
+        ],
+        _accept_call(),
+    )
+    client, _, _ = _make(stt=ScriptedSTT(_t("सबसे ऊँची बोली स्वीकार कर दो")), llm=llm)
+    with client.websocket_connect("/v1/voice") as ws:
+        _start(ws)
+        _speak(ws)
+        messages, _ = _collect_turn(ws)
+    types = _types(messages)
+    assert "assistant.text.delta" in types and "confirm.request" in types
+    assert types.index("assistant.text.delta") < types.index("confirm.request")
+    assert messages[-1] == {"type": "state", "value": "awaiting_confirmation"}
+
+
+def test_barge_in_after_a_proposal_never_leaves_an_unheard_action_pending() -> None:
+    """Re-review blocker: a turn cancelled after the write was stored but before its question
+    was sent must cancel that action, so a later bare "हाँ" can't execute an unheard write."""
+    client, store, _ = _make(
+        stt=ScriptedSTT(_t("सबसे ऊँची बोली स्वीकार कर दो"), _t("हाँ")),
+        llm=SequencedLLM(_accept_call()),
+    )
+    original_add = store.add_message
+
+    async def slow_user_message(*args, **kwargs):  # type: ignore[no-untyped-def]
+        if kwargs.get("role") == "user":
+            await asyncio.sleep(0.6)  # transcript insert still in flight when the proposal lands
+        return await original_add(*args, **kwargs)
+
+    store.add_message = slow_user_message  # type: ignore[method-assign]
+    with client.websocket_connect("/v1/voice") as ws:
+        _start(ws)
+        _speak(ws, "u-1")
+        while True:  # wait until thinking has started, then barge in
+            frame = ws.receive()
+            if frame.get("text") and json.loads(frame["text"]).get("value") == "thinking":
+                break
+        import time as _time
+
+        _time.sleep(0.2)  # the (instant) LLM has proposed; the turn is parked on the transcript
+        ws.send_text(json.dumps({"type": "interrupt", "reason": "user_tap"}))
+        _collect_turn(ws)
+        # The unheard proposal is withdrawn as soon as the interrupted turn finishes.
+        assert [a.status for a in store.actions.values()] == ["cancelled"]
+        _speak(ws, "u-2")  # a bare "हाँ"
+        second, _ = _collect_turn(ws)
+
+    assert not any(
+        m["type"] == "action.result" and m.get("status") == "executed_ok" for m in second
+    )
+    # "हाँ" executed nothing (the model may re-propose, which asks again: that's fine).
+    assert all(a.status != "executed_ok" for a in store.actions.values())
+
+
+def test_muted_protected_turn_never_shows_or_leaves_a_new_proposal() -> None:
+    """Focused re-check blocker: with action A open, a correction turn is protected (muted, not
+    cancelled, on barge-in). If it proposes B, B must be withdrawn — never shown silently — so a
+    later "हाँ" can't execute a question the user never heard."""
+    accept_b7 = [
+        ToolCall(id="w2", name="accept_bid", args_json='{"listing_ref":"L-102","bid_ref":"B-7"}'),
+        Done(usage=Usage(0, 0)),
+    ]
+    client, store, _ = _make(
+        stt=ScriptedSTT(_t("सबसे ऊँची बोली स्वीकार कर दो"), _t("नहीं, दूसरी वाली"), _t("हाँ")),
+        llm=SlowLLM(_accept_call(), accept_b7),
+    )
+    with client.websocket_connect("/v1/voice") as ws:
+        _start(ws)
+        _speak(ws, "u-1")
+        first, _ = _collect_turn(ws)
+        action_a = next(m for m in first if m["type"] == "confirm.request")["action_id"]
+        _speak(ws, "u-2")  # the correction: the LLM (slow) will propose B
+        while True:
+            frame = ws.receive()
+            if frame.get("text") and json.loads(frame["text"]).get("value") == "thinking":
+                break
+        ws.send_text(json.dumps({"type": "interrupt", "reason": "barge_in"}))
+        second, _ = _collect_turn(ws)
+        _speak(ws, "u-3")  # a bare "हाँ"
+        third, _ = _collect_turn(ws)
+
+    requests = [m for m in second if m["type"] == "confirm.request"]
+    assert requests == []  # B's card was never shown while muted
+    statuses = {a.id: a.status for a in store.actions.values()}
+    assert statuses[action_a] == "cancelled"
+    assert all(s != "executed_ok" for s in statuses.values())
+    assert not any(m["type"] == "action.result" and m.get("status") == "executed_ok" for m in third)

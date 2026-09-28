@@ -185,7 +185,15 @@ def _build_speech(settings: Settings) -> Speech:
         settings, "groq", settings.groq_api_key, "GROQ_API_KEY"
     ):
         groq = GroqWhisperSTT(
-            settings.groq_api_key, base_url=settings.groq_base_url, model=settings.groq_stt_model
+            settings.groq_api_key,
+            base_url=settings.groq_base_url,
+            model=settings.groq_stt_model,
+            fast_model=settings.groq_stt_model_fast,
+            accurate_languages=tuple(
+                lang.strip()
+                for lang in settings.groq_stt_accurate_languages.split(",")
+                if lang.strip()
+            ),
         )
         closers.append(groq.aclose)
         stt = groq
@@ -197,11 +205,25 @@ def _build_speech(settings: Settings) -> Speech:
     return Speech(stt, FakeTTS(), "wav", 22_050, closers)
 
 
+WARM_UP_TIMEOUT_S = 5.0  # a hanging warm-up must not delay the others
+
+
 async def _warm_up(
-    pack: LoadedPack, embeddings: EmbeddingProvider, knowledge_store: KnowledgeStore | None
+    pack: LoadedPack,
+    embeddings: EmbeddingProvider,
+    knowledge_store: KnowledgeStore | None,
+    clients: tuple[object, ...] = (),
 ) -> None:
     """Open the DB pool and embedding client before the first user turn (measured: the first
-    retrieval took 5.8 s cold vs 1.2 s warm). Best-effort: a failure only means a slower turn."""
+    retrieval took 5.8 s cold vs 1.2 s warm), plus any client with a `warm()` (LLM/STT
+    connections). Best-effort: a failure only means a slower first turn."""
+    for client in clients:
+        warm = getattr(client, "warm", None)
+        if warm is not None:
+            try:
+                await asyncio.wait_for(warm(), timeout=WARM_UP_TIMEOUT_S)
+            except Exception:
+                logger.warning("client warm-up failed", exc_info=True)
     if knowledge_store is None:
         return
     from voice_core.kb.retriever import auto_retrieve
@@ -255,7 +277,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.llm = _build_llm(settings)
     app.state.embeddings = embeddings
     app.state.knowledge_store = knowledge_store
-    app.state.auto_rag_min_sim = settings.auto_rag_min_sim
+    app.state.auto_rag_min_sim = settings.auto_rag_min_sim if settings.auto_rag_enabled else None
     app.state.auth_verifier = _build_auth_verifier(settings)
     conversation_store = _build_conversation_store(settings)
     app.state.conversation_store = conversation_store
@@ -274,12 +296,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         max_utterance_ms=settings.max_utterance_seconds * 1000,
         audio_out_encoding=speech.audio_encoding,
         audio_out_sample_rate=speech.audio_sample_rate,
+        filler_after_s=settings.voice_filler_after_s,
         embeddings=embeddings,
         knowledge_store=knowledge_store,
-        auto_rag_min_sim=settings.auto_rag_min_sim,
+        auto_rag_min_sim=app.state.auto_rag_min_sim,
     )
 
-    warm_up = asyncio.create_task(_warm_up(pack, embeddings, knowledge_store))
+    warm_up = asyncio.create_task(
+        _warm_up(pack, embeddings, knowledge_store, (app.state.llm, speech.stt))
+    )
 
     yield
 
