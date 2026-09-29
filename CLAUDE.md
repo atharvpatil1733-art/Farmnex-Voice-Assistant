@@ -16,6 +16,8 @@ reusable core and must stay domain-agnostic.
 Before any non-trivial change read: `docs/SPEC.md` (the source of truth),
 `docs/PROTOCOL.md` (client↔server messages), `docs/PORTING.md` (how the kit moves).
 Track progress in `docs/STATUS.md`.
+**Porting into FarmNex (the real host app):** read `docs/FARMNEX_HOST.md` before changing the pack,
+auth, tool handlers or M5 — it lists the FarmNex facts and the changes to make, in order.
 
 ## Golden rules — never violate these
 

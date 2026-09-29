@@ -3,6 +3,8 @@
 Update after every milestone. Keep it short and factual.
 
 ## Current milestone
+**Next (2026-09-29): port into FarmNex — follow `docs/FARMNEX_HOST.md` (auth adapter, pack facts, crops,
+Crop Rescue tools, http handlers, deploy, M5 package without the Supabase demo app).**
 M1, M2, M3 gates PASSED. **M4 latency gate PASSES (2026-09-28): median first audio 2.41 s
 (4G model; target ≤ 2.5 s); real answer audio 4.48 s median.** First audio is usually the pack
 filler ("एक सेकंड, देख रही हूँ"); the answer's own audio is reported separately. Free voice stack
